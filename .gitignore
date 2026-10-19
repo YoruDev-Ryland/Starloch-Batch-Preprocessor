@@ -1,0 +1,4 @@
+# Only publish the SBPP script; everything else in this folder stays local.
+*
+!.gitignore
+!Starloch_Batch_Preprocessor.py
