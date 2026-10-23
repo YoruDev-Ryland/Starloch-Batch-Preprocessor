@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import traceback
+import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
@@ -90,8 +91,12 @@ from PyQt6.QtWidgets import (  # pylint: disable=wrong-import-position
 
 APP_NAME = "Starloch Batch Preprocessor"
 APP_SLUG = "starloch-batch-preprocessor"
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 KOFI_URL = "https://ko-fi.com/rkremeier"
+GITHUB_REPO = "YoruDev-Ryland/Starloch-Batch-Preprocessor"
+SCRIPT_FILENAME = "Starloch_Batch_Preprocessor.py"
+UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600
 SCHEMA_VERSION = 1
 DEFAULTS_REVISION = 8
 METADATA_CACHE_VERSION = 3
@@ -4148,6 +4153,60 @@ def option_path(name: str, path: Path) -> str:
     return quoted(f"-{name}={path}")
 
 
+PLAIN_FITS_SUFFIXES = (".fit", ".fits", ".fts")
+_SYMLINK_SUPPORT: dict[str, bool] = {}
+
+
+def symlinks_usable(directory: Path) -> bool:
+    """Whether symlinks created in `directory` can actually be followed.
+
+    Some Windows 11 builds allow creating symlinks but then refuse to traverse
+    them ("untrusted mount point", WinError 448). Siril's convert still reports
+    success on such links, so the failure only appears later as "Sequence not
+    found". Probe once per drive with a real read through a link.
+    """
+    key = Path(directory).anchor or str(directory)
+    if key not in _SYMLINK_SUPPORT:
+        usable = False
+        try:
+            with tempfile.TemporaryDirectory(
+                prefix=".sbpp-link-probe-", dir=directory, ignore_cleanup_errors=True
+            ) as temporary:
+                target = Path(temporary) / "probe.txt"
+                link = Path(temporary) / "probe-link.txt"
+                target.write_bytes(b"ok")
+                try:
+                    link.symlink_to(target)
+                    usable = link.read_bytes() == b"ok"
+                except OSError:
+                    usable = False
+                try:
+                    link.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except OSError:
+            usable = False
+        _SYMLINK_SUPPORT[key] = usable
+    return _SYMLINK_SUPPORT[key]
+
+
+def link_or_copy(source: Path, target: Path, allow_symlink: bool = True) -> str:
+    """Place `source` at `target` as cheaply as possible; return the method used."""
+    if allow_symlink:
+        try:
+            target.symlink_to(source)
+            return "symlink"
+        except OSError:
+            pass
+    try:
+        os.link(source, target)
+        return "hardlink"
+    except OSError:
+        pass
+    shutil.copy2(source, target)
+    return "copy"
+
+
 def resolve_graxpert_executable(configured: str = "") -> Optional[str]:
     """Resolve the standalone GraXpert CLI on Windows, macOS, or Linux."""
     requested = os.path.expandvars(os.path.expanduser(configured.strip()))
@@ -4472,14 +4531,26 @@ class PipelineEngine:
         SELECT's bare "Sequence not found", so wait for the converted frames and
         write a diagnostic report describing both folders when they never appear.
         """
-        self._cmd("cd", quoted(source))
-        try:
-            self._cmd("convert", base, option_path("out", output))
-        except s.CommandError as exc:
-            raise self._conversion_failure(
-                source, output, base, expected, staging_modes,
-                f"Siril could not convert the {base} frames: {exc}",
-            ) from exc
+        frames = sorted(path for path in source.iterdir() if is_supported(path))
+        if (
+            frames
+            and not symlinks_usable(output)
+            and all(file_suffix(path) in PLAIN_FITS_SUFFIXES for path in frames)
+        ):
+            # Siril's convert would only link these FITS files, and links are
+            # unreadable here. Lay out the sequence directly with hard links or
+            # copies in Siril's naming; SELECT then indexes it.
+            for index, path in enumerate(frames, start=1):
+                link_or_copy(path, output / f"{base}_{index:05d}.fit", allow_symlink=False)
+        else:
+            self._cmd("cd", quoted(source))
+            try:
+                self._cmd("convert", base, option_path("out", output))
+            except s.CommandError as exc:
+                raise self._conversion_failure(
+                    source, output, base, expected, staging_modes,
+                    f"Siril could not convert the {base} frames: {exc}",
+                ) from exc
         deadline = time.monotonic() + timeout
         while not any(output.glob(f"{base}_*.fit*")):
             if time.monotonic() >= deadline:
@@ -4617,6 +4688,7 @@ class PipelineEngine:
     @staticmethod
     def _stage_files(files: list[str], destination: Path) -> dict[str, int]:
         destination.mkdir(parents=True, exist_ok=False)
+        allow_symlink = symlinks_usable(destination)
         modes: Counter[str] = Counter()
         for index, source_text in enumerate(files, start=1):
             source = Path(source_text)
@@ -4624,21 +4696,7 @@ class PipelineEngine:
             suffix = source.name[-len(detected_suffix):] if detected_suffix else source.suffix
             stem = source.name[:-len(detected_suffix)] if detected_suffix else source.stem
             name = f"{index:06d}_{slugify(stem, 'frame')}{suffix}"
-            target = destination / name
-            try:
-                target.symlink_to(source)
-                modes["symlink"] += 1
-                continue
-            except OSError:
-                pass
-            try:
-                os.link(source, target)
-                modes["hardlink"] += 1
-                continue
-            except OSError:
-                pass
-            shutil.copy2(source, target)
-            modes["copy"] += 1
+            modes[link_or_copy(source, destination / name, allow_symlink)] += 1
         return dict(modes)
 
     def _materialize_master(self, choice: CalibrationChoice, label: str) -> Path:
@@ -5916,10 +5974,7 @@ class PipelineEngine:
                     path, [other for other in solved if other != path], target
                 )
             else:
-                try:
-                    target.symlink_to(path)
-                except OSError:
-                    shutil.copy2(path, target)
+                link_or_copy(path, target, symlinks_usable(registration_input))
         count = self._convert_sequence(
             registration_input, registered_root, "merge", len(solved), None
         )
@@ -6130,6 +6185,146 @@ class PipelineEngine:
             raise
 
 
+# --- Self-update ---------------------------------------------------------------
+
+
+@dataclass
+class ReleaseInfo:
+    version: str
+    notes: str
+    asset_url: str
+    page_url: str
+
+
+def version_tuple(text: str) -> tuple[int, int, int]:
+    match = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", text.strip())
+    if not match:
+        return (0, 0, 0)
+    return tuple(int(part) for part in match.groups())  # type: ignore[return-value]
+
+
+def _github_request(url: str, timeout: float) -> bytes:
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": f"SBPP/{VERSION}",
+    })
+    context = None
+    try:  # some Python builds (notably on macOS) ship without CA certificates
+        import certifi
+        import ssl
+
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        pass
+    with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
+        return response.read()
+
+
+def fetch_latest_release(timeout: float = 10.0) -> ReleaseInfo:
+    payload = json.loads(_github_request(UPDATE_API_URL, timeout).decode("utf-8"))
+    asset = next(
+        (item for item in payload.get("assets", []) if item.get("name") == SCRIPT_FILENAME),
+        None,
+    )
+    if asset is None:
+        raise RuntimeError(f"The latest release does not include {SCRIPT_FILENAME}.")
+    return ReleaseInfo(
+        version=str(payload.get("tag_name", "")).lstrip("v"),
+        notes=str(payload.get("body") or "").strip(),
+        asset_url=str(asset["browser_download_url"]),
+        page_url=str(payload.get("html_url") or f"https://github.com/{GITHUB_REPO}/releases"),
+    )
+
+
+def script_version(text: str) -> Optional[str]:
+    match = re.search(r'^VERSION = "([^"]+)"$', text, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def validate_update(data: bytes, expected_version: str) -> None:
+    """Refuse anything that is not a complete SBPP script of the expected version."""
+    try:
+        text = data.decode("utf-8")
+        ast.parse(text)
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise RuntimeError(f"The downloaded update is damaged ({exc}).") from exc
+    found = script_version(text)
+    if found != expected_version or "class MainWindow" not in text:
+        raise RuntimeError(
+            f"The downloaded file is not SBPP {expected_version} (found {found or 'no version'})."
+        )
+
+
+def download_release(release: ReleaseInfo, timeout: float = 60.0) -> bytes:
+    data = _github_request(release.asset_url, timeout)
+    validate_update(data, release.version)
+    return data
+
+
+def find_installed_scripts(script_dirs: Iterable[str], running_file: Path) -> list[Path]:
+    """Locate SBPP installs Siril can launch.
+
+    Siril may run a temporary copy of the script, so the running file is used
+    only when it carries the real name; otherwise search Siril's script folders.
+    """
+    found: list[Path] = []
+    if running_file.name == SCRIPT_FILENAME and running_file.is_file():
+        found.append(running_file)
+    for directory in script_dirs:
+        root = Path(directory) if directory else None
+        if root is None or not root.is_dir():
+            continue
+        for current, folders, files in os.walk(root):
+            depth = len(Path(current).relative_to(root).parts)
+            folders[:] = [] if depth >= 3 else [
+                name for name in folders if not name.startswith(".") and name != "__pycache__"
+            ]
+            if SCRIPT_FILENAME in files:
+                found.append(Path(current) / SCRIPT_FILENAME)
+    unique: dict[str, Path] = {}
+    for path in found:
+        try:
+            key = os.path.normcase(str(path.resolve()))
+        except OSError:
+            key = os.path.normcase(str(path))
+        unique.setdefault(key, path)
+    return list(unique.values())
+
+
+def install_update(target: Path, data: bytes, backup_dir: Path) -> Path:
+    """Atomically replace `target` with `data`, keeping a backup of the old file."""
+    target = target.resolve()
+    current = script_version(target.read_text(encoding="utf-8", errors="replace"))
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    backup = backup_dir / f"{target.stem}-{current or 'unknown'}.py"
+    shutil.copy2(target, backup)
+    temporary = target.with_name(f".{target.name}.update")
+    temporary.write_bytes(data)
+    try:
+        shutil.copymode(target, temporary)
+    except OSError:
+        pass
+    os.replace(temporary, target)
+    return backup
+
+
+class BackgroundTask(QThread):
+    """Run one blocking call off the GUI thread."""
+
+    done = pyqtSignal(object)
+    error = pyqtSignal(str)
+
+    def __init__(self, function: Callable[[], Any]):
+        super().__init__()
+        self.function = function
+
+    def run(self) -> None:
+        try:
+            self.done.emit(self.function())
+        except Exception as exc:  # surfaced to the user by the caller
+            self.error.emit(str(exc) or type(exc).__name__)
+
+
 class PipelineThread(QThread):
     log_line = pyqtSignal(str)
     progress_value = pyqtSignal(int)
@@ -6183,6 +6378,7 @@ class MainWindow(QMainWindow):
         self.last_run_elapsed = 0.0
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.timeout.connect(self._update_elapsed_display)
+        self.update_task: Optional[BackgroundTask] = None
 
         self.setWindowTitle(f"{APP_NAME} {VERSION}")
         self.resize(1320, 820)
@@ -6192,6 +6388,7 @@ class MainWindow(QMainWindow):
         index = self.profile_combo.findText(selected)
         self.profile_combo.setCurrentIndex(max(0, index))
         self._load_profile(self.profile_combo.currentText())
+        QTimer.singleShot(1500, self._startup_update_check)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -6217,6 +6414,16 @@ class MainWindow(QMainWindow):
         title_row = QHBoxLayout()
         title_row.addWidget(title)
         title_row.addStretch(1)
+        self.update_button = QPushButton("Check for updates")
+        self.update_button.setToolTip(f"Check GitHub for a newer {APP_NAME} and install it.")
+        self.update_button.clicked.connect(lambda: self._check_for_updates(manual=True))
+        self.update_on_startup = QCheckBox("Check at startup")
+        self.update_on_startup.setToolTip("Look for a new version once a day when SBPP opens.")
+        self.update_on_startup.setChecked(bool(self._update_settings()["check_on_startup"]))
+        self.update_on_startup.toggled.connect(self._update_on_startup_toggled)
+        title_row.addWidget(self.update_on_startup)
+        title_row.addWidget(self.update_button)
+        title_row.addSpacing(12)
         title_row.addWidget(kofi)
         layout.addLayout(title_row)
         layout.addWidget(subtitle)
@@ -7632,7 +7839,189 @@ class MainWindow(QMainWindow):
             f"{message}\nElapsed: {human_duration(self.last_run_elapsed)}",
         )
 
+    # --- Self-update -----------------------------------------------------------
+
+    def _update_settings(self) -> dict[str, Any]:
+        settings = self.store.payload.setdefault("updates", {})
+        settings.setdefault("check_on_startup", True)
+        settings.setdefault("last_check_epoch", 0.0)
+        settings.setdefault("skipped_version", "")
+        settings.setdefault("install_path", "")
+        return settings
+
+    def _update_on_startup_toggled(self, checked: bool) -> None:
+        self._update_settings()["check_on_startup"] = bool(checked)
+        self.store.save()
+
+    def _startup_update_check(self) -> None:
+        settings = self._update_settings()
+        if not settings["check_on_startup"]:
+            return
+        if time.time() - float(settings["last_check_epoch"] or 0) < UPDATE_CHECK_INTERVAL_SECONDS:
+            return
+        self._check_for_updates(manual=False)
+
+    def _run_update_task(
+        self,
+        function: Callable[[], Any],
+        on_done: Callable[[Any], None],
+        on_error: Callable[[str], None],
+        busy_text: str,
+    ) -> None:
+        self.update_button.setEnabled(False)
+        self.update_button.setText(busy_text)
+
+        def finish() -> None:
+            self.update_button.setEnabled(True)
+            self.update_button.setText("Check for updates")
+            self.update_task = None
+
+        task = BackgroundTask(function)
+        task.done.connect(lambda result: (finish(), on_done(result)))
+        task.error.connect(lambda message: (finish(), on_error(message)))
+        self.update_task = task
+        task.start()
+
+    def _check_for_updates(self, manual: bool) -> None:
+        if self.update_task is not None:
+            return
+
+        def failed(message: str) -> None:
+            if manual:
+                QMessageBox.warning(
+                    self, "Update check failed",
+                    f"Could not reach GitHub to check for updates.\n\n{message}",
+                )
+            else:
+                self._append_log(f"Update check skipped: {message}")
+
+        self._run_update_task(
+            fetch_latest_release,
+            lambda release: self._update_check_finished(release, manual),
+            failed,
+            "Checking…",
+        )
+
+    def _update_check_finished(self, release: ReleaseInfo, manual: bool) -> None:
+        settings = self._update_settings()
+        settings["last_check_epoch"] = time.time()
+        self.store.save()
+        if version_tuple(release.version) <= version_tuple(VERSION):
+            if manual:
+                QMessageBox.information(
+                    self, "No update available",
+                    f"You are running the latest version ({VERSION}).",
+                )
+            return
+        if not manual and settings["skipped_version"] == release.version:
+            return
+        notes = release.notes or "No release notes."
+        if len(notes) > 1500:
+            notes = notes[:1500].rstrip() + "…"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Update available")
+        box.setText(f"{APP_NAME} {release.version} is available (you have {VERSION}).")
+        box.setInformativeText(f"What's new:\n{notes}")
+        update = box.addButton("Update now", QMessageBox.ButtonRole.AcceptRole)
+        skip = box.addButton("Skip this version", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(update)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is skip:
+            settings["skipped_version"] = release.version
+            self.store.save()
+        elif clicked is update:
+            self._start_update(release)
+
+    def _script_search_dirs(self) -> list[str]:
+        try:
+            value = self.siril.get_siril_config("gui", "script_path")
+        except Exception:  # older Siril or a closed connection: fall back to a manual pick
+            return []
+        if isinstance(value, str):
+            return [part for part in value.split(";") if part.strip()]
+        return [str(part) for part in value or [] if str(part).strip()]
+
+    def _locate_install(self) -> Optional[Path]:
+        settings = self._update_settings()
+        remembered = Path(settings["install_path"]) if settings["install_path"] else None
+        if remembered is not None and remembered.is_file():
+            return remembered
+        candidates = find_installed_scripts(self._script_search_dirs(), Path(__file__))
+        if len(candidates) == 1:
+            choice: Optional[Path] = candidates[0]
+        elif candidates:
+            from PyQt6.QtWidgets import QInputDialog  # local import keeps the main list compact
+
+            labels = [str(path) for path in candidates]
+            picked, accepted = QInputDialog.getItem(
+                self, "Choose the copy to update",
+                "Several copies of SBPP were found in Siril's script folders.\n"
+                "Which one do you launch from Siril?",
+                labels, 0, False,
+            )
+            choice = Path(picked) if accepted else None
+        else:
+            QMessageBox.information(
+                self, "Locate SBPP",
+                f"SBPP could not find {SCRIPT_FILENAME} in Siril's script folders.\n"
+                "Please select the copy you launch from Siril.",
+            )
+            picked, _filter = QFileDialog.getOpenFileName(
+                self, "Locate SBPP", str(Path.home()), f"SBPP script ({SCRIPT_FILENAME});;Python (*.py)",
+            )
+            choice = Path(picked) if picked else None
+        if choice is not None:
+            settings["install_path"] = str(choice)
+            self.store.save()
+        return choice
+
+    def _start_update(self, release: ReleaseInfo) -> None:
+        if self.pipeline_thread and self.pipeline_thread.isRunning():
+            QMessageBox.information(
+                self, "Processing in progress",
+                "SBPP can't update while processing. Use Check for updates again "
+                "once the run has finished.",
+            )
+            return
+        target = self._locate_install()
+        if target is None:
+            return
+
+        def downloaded(data: bytes) -> None:
+            try:
+                backup = install_update(target, data, self.store.config_dir / "backups")
+            except OSError as exc:
+                QMessageBox.warning(
+                    self, "Update failed",
+                    f"SBPP could not replace {target}:\n{exc}\n\n"
+                    f"You can download the new version manually from:\n{release.page_url}",
+                )
+                return
+            self._append_log(f"Updated SBPP {VERSION} → {release.version} at {target}.")
+            QMessageBox.information(
+                self, "Update installed",
+                f"SBPP {release.version} is installed.\n\n"
+                "Close this window and launch SBPP again from Siril's Scripts menu "
+                f"to use the new version.\n\nThe previous version was saved to:\n{backup}",
+            )
+
+        def failed(message: str) -> None:
+            QMessageBox.warning(
+                self, "Update failed",
+                f"The update could not be downloaded:\n{message}\n\n"
+                f"Your current version was not changed. Manual download:\n{release.page_url}",
+            )
+
+        self._run_update_task(lambda: download_release(release), downloaded, failed, "Updating…")
+
     def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API name
+        if self.update_task is not None:
+            # Destroying a running QThread aborts the process; a check or
+            # download is short, so let it finish.
+            self.update_task.wait(15000)
         if self.pipeline_thread and self.pipeline_thread.isRunning():
             QMessageBox.warning(
                 self, APP_NAME,
