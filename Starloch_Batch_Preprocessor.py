@@ -14,6 +14,7 @@ sirilpy; optional mosaic gradient correction uses the standalone GraXpert CLI.
 from __future__ import annotations
 
 import ast
+import faulthandler
 import json
 import math
 import os
@@ -33,7 +34,7 @@ from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional, TextIO
 
 import sirilpy as s
 
@@ -91,7 +92,7 @@ from PyQt6.QtWidgets import (  # pylint: disable=wrong-import-position
 
 APP_NAME = "Starloch Batch Preprocessor"
 APP_SLUG = "starloch-batch-preprocessor"
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 KOFI_URL = "https://ko-fi.com/rkremeier"
 GITHUB_REPO = "YoruDev-Ryland/Starloch-Batch-Preprocessor"
 SCRIPT_FILENAME = "Starloch_Batch_Preprocessor.py"
@@ -4302,7 +4303,9 @@ class PipelineEngine:
     ):
         self.siril = siril
         self.plan = plan
-        self.log_callback = log_callback
+        self._ui_log = log_callback
+        self.log_callback = self._log
+        self._run_log: Optional[TextIO] = None
         self.progress_callback = progress_callback
         self.cancel_check = cancel_check
         self.run_dir: Optional[Path] = None
@@ -4314,6 +4317,44 @@ class PipelineEngine:
         self.steps_done = 0
         self.started_monotonic: Optional[float] = None
         self.started_utc = ""
+
+    def _log(self, message: str) -> None:
+        """Show a line in the UI and append it to the run's sbpp.log.
+
+        The file is written from the processing thread and flushed per line, so
+        it keeps everything up to a crash even if the UI never displayed it.
+        """
+        self._write_run_log(message)
+        self._ui_log(message)
+
+    def _write_run_log(self, message: str) -> None:
+        if self._run_log is None:
+            return
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self._run_log.write(f"[{stamp}] {message}\n")
+            self._run_log.flush()
+        except OSError:
+            self._run_log = None
+
+    def _open_run_log(self) -> None:
+        assert self.run_dir is not None
+        try:
+            self._run_log = open(self.run_dir / "sbpp.log", "a", encoding="utf-8")
+        except OSError as exc:
+            self._ui_log(f"Could not create sbpp.log in the run folder: {exc}")
+            return
+        self._write_run_log(
+            f"{APP_NAME} {VERSION} on {platform.platform()} / Python {platform.python_version()}"
+        )
+
+    def _close_run_log(self) -> None:
+        if self._run_log is not None:
+            try:
+                self._run_log.close()
+            except OSError:
+                pass
+            self._run_log = None
 
     def _estimate_steps(self) -> int:
         merge = getattr(self.plan, "master_merge", None)
@@ -6118,6 +6159,8 @@ class PipelineEngine:
         self.run_dir = output_root / f"{self.plan.output_prefix}_{integration}_{stamp}"
         self.run_dir.mkdir(parents=False, exist_ok=False)
         (self.run_dir / "masters").mkdir()
+        self._open_run_log()
+        self.log_callback(f"Run folder: {self.run_dir}")
         self.manifest = {
             "schema_version": SCHEMA_VERSION,
             "application": APP_NAME,
@@ -6180,9 +6223,87 @@ class PipelineEngine:
             self.manifest["failed_utc"] = utc_now()
             self.manifest["error"] = str(exc)
             self.manifest["traceback"] = traceback.format_exc()
+            self._write_run_log(f"Processing failed:\n{self.manifest['traceback'].rstrip()}")
             self._finish_timing("failed")
             self._write_manifest()
             raise
+        finally:
+            self._close_run_log()
+
+
+# --- Crash-safe session log ----------------------------------------------------
+
+
+class SessionLog:
+    """Append-only log of one SBPP session, flushed per line to survive crashes.
+
+    Python's fault handler writes here too, so even a hard crash of the
+    interpreter leaves a stack trace behind.
+    """
+
+    KEEP_SESSIONS = 20
+
+    def __init__(self, directory: Path):
+        self.directory = directory
+        self.path: Optional[Path] = None
+        self._handle: Optional[TextIO] = None
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.path = directory / f"sbpp_{stamp}_{os.getpid()}.log"
+            self._handle = open(self.path, "a", encoding="utf-8")
+        except OSError:
+            self._handle = None
+            return
+        for old in sorted(directory.glob("sbpp_*.log"))[:-self.KEEP_SESSIONS]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        try:
+            faulthandler.enable(file=self._handle, all_threads=True)
+        except (OSError, RuntimeError, ValueError):
+            pass
+        self.write(
+            f"{APP_NAME} {VERSION} session started on {platform.platform()} / "
+            f"Python {platform.python_version()}"
+        )
+
+    def write(self, message: str) -> None:
+        if self._handle is None:
+            return
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self._handle.write(f"[{stamp}] {message}\n")
+            self._handle.flush()
+        except (OSError, ValueError):
+            self._handle = None
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            faulthandler.disable()
+            self._handle.close()
+        except (OSError, ValueError):
+            pass
+        self._handle = None
+
+
+def install_exception_logging(record: Callable[[str], None]) -> None:
+    """Record uncaught exceptions instead of letting PyQt abort the process."""
+
+    def hook(kind: type[BaseException], value: BaseException, trace: Any) -> None:
+        if issubclass(kind, KeyboardInterrupt):
+            sys.__excepthook__(kind, value, trace)
+            return
+        text = "".join(traceback.format_exception(kind, value, trace)).rstrip()
+        try:
+            record(f"Unexpected error:\n{text}")
+        except Exception:  # never let the hook itself fail
+            sys.__excepthook__(kind, value, trace)
+
+    sys.excepthook = hook
 
 
 # --- Self-update ---------------------------------------------------------------
@@ -6337,6 +6458,7 @@ class PipelineThread(QThread):
         self.siril = siril
         self.plan = plan
         self._cancel_requested = False
+        self.engine: Optional[PipelineEngine] = None
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -6350,6 +6472,7 @@ class PipelineThread(QThread):
             self.progress_value.emit,
             lambda: self._cancel_requested,
         )
+        self.engine = engine
         try:
             run_dir = engine.run()
             self.succeeded.emit(str(run_dir))
@@ -6365,6 +6488,8 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.siril = siril
         self.store = ProfileStore()
+        self.session_log = SessionLog(self.store.config_dir / "logs")
+        self.last_run_dir: Optional[Path] = None
         self.cache = MetadataCache(self.store.cache_path)
         self.current_plan: Optional[ProcessingPlan] = None
         self.pipeline_thread: Optional[PipelineThread] = None
@@ -6972,7 +7097,42 @@ class MainWindow(QMainWindow):
         self.log_edit = QPlainTextEdit()
         self.log_edit.setReadOnly(True)
         layout.addWidget(self.log_edit)
+        buttons = QHBoxLayout()
+        open_session_logs = QPushButton("Open session logs")
+        open_session_logs.setToolTip(
+            "Every SBPP session is logged here, including scans and crashes."
+        )
+        open_session_logs.clicked.connect(
+            lambda: self._open_folder(self.session_log.directory)
+        )
+        self.open_run_folder_button = QPushButton("Open last run folder")
+        self.open_run_folder_button.setToolTip(
+            "Contains sbpp.log, manifest.json, commands.ssf and any diagnostics."
+        )
+        self.open_run_folder_button.setEnabled(False)
+        self.open_run_folder_button.clicked.connect(
+            lambda: self.last_run_dir and self._open_folder(self.last_run_dir)
+        )
+        buttons.addWidget(open_session_logs)
+        buttons.addWidget(self.open_run_folder_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
         return tab
+
+    def record_unexpected_error(self, text: str) -> None:
+        self._append_log(text)
+        try:
+            self.siril.log(f"SBPP: {text.splitlines()[-1]}")
+        except Exception:  # Siril may already be gone
+            pass
+
+    def _open_folder(self, folder: Path) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        folder.mkdir(parents=True, exist_ok=True)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            QMessageBox.information(self, APP_NAME, f"The folder is:\n{folder}")
 
     def _populate_drizzle_channels(self, plan: ProcessingPlan) -> None:
         self._updating_drizzle = True
@@ -7433,6 +7593,7 @@ class MainWindow(QMainWindow):
     def _append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         self.log_edit.appendPlainText(f"[{stamp}] {message}")
+        self.session_log.write(message)
 
     def _update_elapsed_display(self) -> None:
         if self.run_started_monotonic is None:
@@ -7800,6 +7961,10 @@ class MainWindow(QMainWindow):
             )
         self.elapsed_timer.stop()
         self.run_started_monotonic = None
+        engine = self.pipeline_thread.engine if self.pipeline_thread else None
+        if engine is not None and engine.run_dir is not None:
+            self.last_run_dir = engine.run_dir
+            self.open_run_folder_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.scan_button.setEnabled(True)
         self.save_plan_button.setEnabled(self.current_plan is not None)
@@ -8116,6 +8281,7 @@ def main() -> int:
     theme_mode = apply_siril_theme(application, siril)
     siril.log(f"SBPP: Qt interface theme follows Siril ({theme_mode}).")
     window = MainWindow(siril)
+    install_exception_logging(window.record_unexpected_error)
     window.show()
     if owns_application:
         return application.exec()
