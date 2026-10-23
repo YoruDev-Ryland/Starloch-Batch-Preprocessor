@@ -17,6 +17,7 @@ import ast
 import json
 import math
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -89,7 +90,7 @@ from PyQt6.QtWidgets import (  # pylint: disable=wrong-import-position
 
 APP_NAME = "Starloch Batch Preprocessor"
 APP_SLUG = "starloch-batch-preprocessor"
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 KOFI_URL = "https://ko-fi.com/rkremeier"
 SCHEMA_VERSION = 1
 DEFAULTS_REVISION = 8
@@ -4456,6 +4457,121 @@ class PipelineEngine:
                 + ", ".join(str(path) for path in missing)
             )
 
+    def _convert_sequence(
+        self,
+        source: Path,
+        output: Path,
+        base: str,
+        expected: int,
+        staging_modes: Optional[dict[str, int]] = None,
+        timeout: float = 30.0,
+    ) -> int:
+        """Convert every image in `source` into a `base` sequence in `output`.
+
+        A conversion that silently produces nothing otherwise surfaces only as
+        SELECT's bare "Sequence not found", so wait for the converted frames and
+        write a diagnostic report describing both folders when they never appear.
+        """
+        self._cmd("cd", quoted(source))
+        try:
+            self._cmd("convert", base, option_path("out", output))
+        except s.CommandError as exc:
+            raise self._conversion_failure(
+                source, output, base, expected, staging_modes,
+                f"Siril could not convert the {base} frames: {exc}",
+            ) from exc
+        deadline = time.monotonic() + timeout
+        while not any(output.glob(f"{base}_*.fit*")):
+            if time.monotonic() >= deadline:
+                raise self._conversion_failure(
+                    source, output, base, expected, staging_modes,
+                    f"Siril's convert produced no {base} frames in {timeout:.0f} seconds.",
+                )
+            time.sleep(0.1)
+        self._cmd("cd", quoted(output))
+        try:
+            self._cmd("select", base, "1", str(expected))
+        except s.CommandError as exc:
+            raise self._conversion_failure(
+                source, output, base, expected, staging_modes,
+                f"Siril converted frames but could not select the {base} sequence: {exc}",
+            ) from exc
+        return self._seq_count(output, base)
+
+    def _conversion_failure(
+        self,
+        source: Path,
+        output: Path,
+        base: str,
+        expected: int,
+        staging_modes: Optional[dict[str, int]],
+        reason: str,
+    ) -> RuntimeError:
+        """Write a shareable report for a failed conversion and build the error."""
+
+        def describe(path: Path) -> str:
+            try:
+                if path.is_symlink():
+                    target = os.readlink(path)
+                    state = "ok" if path.exists() else "BROKEN, target missing"
+                    return f"{path.name} -> {target} (symlink, {state})"
+                if path.is_dir():
+                    return f"{path.name}/ (folder)"
+                return f"{path.name} ({path.stat().st_size} bytes)"
+            except OSError as exc:
+                return f"{path.name} (unreadable: {exc})"
+
+        def listing(directory: Path, limit: int = 12) -> list[str]:
+            if not directory.is_dir():
+                return ["  (folder does not exist)"]
+            try:
+                entries = sorted(directory.iterdir())
+            except OSError as exc:
+                return [f"  (could not list folder: {exc})"]
+            lines = [f"  {len(entries)} entries"]
+            lines += [f"  {describe(entry)}" for entry in entries[:limit]]
+            if len(entries) > limit:
+                lines.append(f"  … and {len(entries) - limit} more")
+            return lines
+
+        lines = [
+            f"SBPP {VERSION} conversion failure report",
+            f"Time: {utc_now()}",
+            f"System: {platform.platform()} / Python {platform.python_version()}",
+            f"Reason: {reason}",
+            f"Sequence: {base} (expected {expected} frames)",
+            f"Staging method: {staging_modes or 'n/a'}",
+            "",
+            f"Source folder: {source}",
+            *listing(source),
+            "",
+            f"Output folder: {output}",
+            *listing(output),
+        ]
+        report = output / f"{base}_conversion.txt"
+        if report.is_file():
+            try:
+                text = report.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                text = []
+            lines += ["", "Siril conversion report (first 20 lines):"]
+            lines += [f"  {line}" for line in text[:20]]
+        lines += [
+            "",
+            "Please send this file together with the Siril Console log from the",
+            "same run (the lines around the 'convert' command).",
+        ]
+        text = "\n".join(lines) + "\n"
+        destination = (self.run_dir or output) / "diagnostics" / f"convert_{base}.txt"
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(text, encoding="utf-8")
+            where = f" Diagnostic report: {destination}"
+        except OSError:
+            where = ""
+        self.log_callback(text.rstrip())
+        return RuntimeError(f"{reason}{where}")
+
     @staticmethod
     def _seq_count(directory: Path, base: str, timeout: float = 30.0) -> int:
         """Wait for Siril's post-conversion sequence index and read its count.
@@ -4551,14 +4667,9 @@ class PipelineEngine:
         process.mkdir(parents=True, exist_ok=True)
         modes = self._stage_files(choice.files, staging)
         base = slugify(choice.kind.lower())
-        self._cmd("cd", quoted(staging))
-        self._cmd("convert", base, option_path("out", process))
-        self._cmd("cd", quoted(process))
-        # `convert` may leave sequence discovery to the next sequence command
-        # when invoked through sirilpy. SELECT forces Siril to discover/write
-        # the standard .seq index, while keeping every converted frame enabled.
-        self._cmd("select", base, "1", str(len(choice.files)))
-        count = self._seq_count(process, base)
+        count = self._convert_sequence(
+            staging, process, base, len(choice.files), modes
+        )
         output_base = self.run_dir / "masters" / f"master_{job}"
         if choice.kind in {FRAME_BIAS, FRAME_DARK, FRAME_DARKFLAT, "BPM"}:
             if count >= 5:
@@ -4640,11 +4751,9 @@ class PipelineEngine:
         process.mkdir(parents=True, exist_ok=True)
         modes = self._stage_files(choice.files, staging)
         base = "flat"
-        self._cmd("cd", quoted(staging))
-        self._cmd("convert", base, option_path("out", process))
-        self._cmd("cd", quoted(process))
-        self._cmd("select", base, "1", str(len(choice.files)))
-        count = self._seq_count(process, base)
+        count = self._convert_sequence(
+            staging, process, base, len(choice.files), modes
+        )
         stack_base = base
         if darkflat_master is not None:
             # A conventional flat-dark contains the sensor bias pedestal too.
@@ -4700,11 +4809,9 @@ class PipelineEngine:
         process.mkdir(parents=True, exist_ok=True)
         modes = self._stage_files([item.path for item in subgroup.frames], staging)
         base = f"light_{slugify(subgroup.filter_name)}"
-        self._cmd("cd", quoted(staging))
-        self._cmd("convert", base, option_path("out", process))
-        self._cmd("cd", quoted(process))
-        self._cmd("select", base, "1", str(len(subgroup.frames)))
-        count = self._seq_count(process, base)
+        count = self._convert_sequence(
+            staging, process, base, len(subgroup.frames), modes
+        )
         args = ["calibrate", base]
         # Conventional exact master darks contain the bias pedestal, so the
         # light uses dark OR bias. Siril's optimized subtraction instead needs
@@ -5441,11 +5548,9 @@ class PipelineEngine:
             [str(path) for _filter, _panel, path in ordered_tiles], staging
         )
         base = f"mosaic_tiles_{mode_name}"
-        self._cmd("cd", quoted(staging))
-        self._cmd("convert", base, option_path("out", process_root))
-        self._cmd("cd", quoted(process_root))
-        self._cmd("select", base, "1", str(len(ordered_tiles)))
-        count = self._seq_count(process_root, base)
+        count = self._convert_sequence(
+            staging, process_root, base, len(ordered_tiles), modes
+        )
         if count != len(ordered_tiles):
             raise RuntimeError(
                 f"Mosaic staging expected {len(ordered_tiles)} tile masters but Siril "
@@ -5815,12 +5920,9 @@ class PipelineEngine:
                     target.symlink_to(path)
                 except OSError:
                     shutil.copy2(path, target)
-        self._cmd("cd", quoted(registration_input))
-        self._cmd("convert", "merge", option_path("out", registered_root))
-        self._cmd("cd", quoted(registered_root))
-        # Selecting the converted images makes Siril commit the sequence index.
-        self._cmd("select", "merge", "1", str(len(solved)))
-        count = self._seq_count(registered_root, "merge")
+        count = self._convert_sequence(
+            registration_input, registered_root, "merge", len(solved), None
+        )
         if count != len(solved):
             raise RuntimeError(
                 f"Master merge expected {len(solved)} images but Siril created {count}."
