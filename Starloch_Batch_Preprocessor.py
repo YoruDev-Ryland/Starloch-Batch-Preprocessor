@@ -31,7 +31,7 @@ import traceback
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, TextIO
@@ -1425,6 +1425,12 @@ class DatasetPlan:
         return len(self.panels)
 
 
+def _dataclass_from_dict(cls: type, data: Any) -> Any:
+    """Construct ``cls`` from the dataclass fields present in ``data``."""
+    names = {item.name for item in fields(cls)}
+    return cls(**{key: value for key, value in dict(data).items() if key in names})
+
+
 @dataclass
 class MergeMaster:
     """One finished master light entering a multi-scale master merge."""
@@ -1545,6 +1551,47 @@ class ProcessingPlan:
                         group.unknown_exposure_count
                     )
         return payload
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "ProcessingPlan":
+        """Rebuild a plan saved by ``to_dict`` (e.g. a run's manifest).
+
+        Unknown keys are ignored and missing keys take their defaults, so
+        manifests from older and newer SBPP versions both load.
+        """
+        def subgroup(data: dict[str, Any]) -> LightSubgroup:
+            values = dict(data)
+            values["frames"] = [
+                _dataclass_from_dict(FrameMeta, frame) for frame in data.get("frames", [])
+            ]
+            for kind in ("bias", "dark", "flat", "darkflat", "bpm"):
+                choice = data.get(kind) or {"kind": kind.upper()}
+                values[kind] = _dataclass_from_dict(CalibrationChoice, choice)
+            return _dataclass_from_dict(LightSubgroup, values)
+
+        datasets = []
+        for data in payload.get("datasets", []):
+            values = dict(data)
+            values["channels"] = {
+                filter_name: [subgroup(group) for group in groups]
+                for filter_name, groups in data.get("channels", {}).items()
+            }
+            datasets.append(_dataclass_from_dict(DatasetPlan, values))
+        merge = None
+        if payload.get("master_merge"):
+            values = dict(payload["master_merge"])
+            values["masters"] = [
+                _dataclass_from_dict(MergeMaster, master)
+                for master in values.get("masters", [])
+            ]
+            if "estimated_canvas" in values:
+                values["estimated_canvas"] = tuple(values["estimated_canvas"])
+            merge = _dataclass_from_dict(MasterMergePlan, values)
+        values = dict(payload)
+        values["options"] = _dataclass_from_dict(PlanOptions, payload.get("options", {}))
+        values["datasets"] = datasets
+        values["master_merge"] = merge
+        return _dataclass_from_dict(cls, values)
 
     def channel_uses_drizzle(self, dataset: DatasetPlan, filter_name: str) -> bool:
         return channel_key(dataset.dataset_id, filter_name) in set(self.drizzle_channels)
