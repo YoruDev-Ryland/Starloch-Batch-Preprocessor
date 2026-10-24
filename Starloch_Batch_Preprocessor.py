@@ -101,7 +101,7 @@ from PyQt6.QtWidgets import (  # pylint: disable=wrong-import-position
 
 APP_NAME = "Starloch Batch Preprocessor"
 APP_SLUG = "starloch-batch-preprocessor"
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 KOFI_URL = "https://ko-fi.com/rkremeier"
 GITHUB_REPO = "YoruDev-Ryland/Starloch-Batch-Preprocessor"
 SCRIPT_FILENAME = "Starloch_Batch_Preprocessor.py"
