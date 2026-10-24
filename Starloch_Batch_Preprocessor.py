@@ -92,7 +92,7 @@ from PyQt6.QtWidgets import (  # pylint: disable=wrong-import-position
 
 APP_NAME = "Starloch Batch Preprocessor"
 APP_SLUG = "starloch-batch-preprocessor"
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 KOFI_URL = "https://ko-fi.com/rkremeier"
 GITHUB_REPO = "YoruDev-Ryland/Starloch-Batch-Preprocessor"
 SCRIPT_FILENAME = "Starloch_Batch_Preprocessor.py"
@@ -2877,6 +2877,15 @@ def _row_support_interval(
     return int(indices[starts[best]]), int(indices[ends[best]]) + 1
 
 
+class MosaicCropTooLossy(RuntimeError):
+    """The best clean rectangle keeps too little of an irregular footprint."""
+
+    def __init__(self, kept_fraction: float, valid_fraction: float):
+        super().__init__("The safe mosaic crop would discard more than 75% of the image.")
+        self.kept_fraction = kept_fraction
+        self.valid_fraction = valid_fraction
+
+
 def largest_valid_mask_crop(
     valid_mask: np.ndarray, edge_inset: int = 2
 ) -> tuple[int, int, int, int]:
@@ -2924,7 +2933,10 @@ def largest_valid_mask_crop(
         crop_width -= 2 * inset
         crop_height -= 2 * inset
     if crop_width * crop_height < width * height * 0.25:
-        raise RuntimeError("The safe mosaic crop would discard more than 75% of the image.")
+        raise MosaicCropTooLossy(
+            kept_fraction=crop_width * crop_height / float(width * height),
+            valid_fraction=float(np.count_nonzero(valid_mask)) / float(width * height),
+        )
     return x, y, crop_width, crop_height
 
 
@@ -5301,11 +5313,28 @@ class PipelineEngine:
         mode_manifest = self.manifest.setdefault("mosaics", {}).setdefault(
             dataset.dataset_id, {"panels": dataset.panels, "modes": {}}
         ).setdefault("modes", {}).setdefault(mode_name, {})
-        crop = largest_common_valid_crop(
-            aligned_paths,
-            edge_inset=max(2, self.plan.options.mosaic_feather),
-        )
-        crop_source = "registered_mosaic_output_footprint"
+        try:
+            crop = largest_common_valid_crop(
+                aligned_paths,
+                edge_inset=max(2, self.plan.options.mosaic_feather),
+            )
+            crop_source = "registered_mosaic_output_footprint"
+        except MosaicCropTooLossy as exc:
+            # Irregular panel layouts (staggered rows, missing corners, an
+            # L-shape) have no rectangle that keeps most of the data. Keep
+            # the full shared canvas instead of failing a finished run.
+            crop = (0, 0, sequence_width, sequence_height)
+            crop_source = "uncropped_irregular_footprint"
+            self.log_callback(
+                f"Warning: {dataset.dataset_id} {mode_name} mosaic left uncropped. "
+                f"Every filter covers {exc.valid_fraction:.0%} of the canvas, but the "
+                f"largest clean rectangle would keep only {exc.kept_fraction:.0%}. "
+                "The edges outside the panel footprint stay black; crop them by hand."
+            )
+            mode_manifest["crop_warning"] = {
+                "valid_fraction": round(exc.valid_fraction, 4),
+                "largest_rectangle_fraction": round(exc.kept_fraction, 4),
+            }
         x, y, width, height = crop
         temporary_outputs: list[tuple[Path, Path]] = []
         try:
@@ -5358,6 +5387,8 @@ class PipelineEngine:
             if shared_grid_verified
             else "Star-aligned and cropped"
         )
+        if crop_source == "uncropped_irregular_footprint":
+            alignment_text = alignment_text.replace("cropped", "kept full canvas for")
         self._tick(
             f"{alignment_text} {count} {mode_name} filter mosaic(s) "
             f"to {width}×{height}."
