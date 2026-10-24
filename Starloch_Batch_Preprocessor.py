@@ -1428,6 +1428,11 @@ class DatasetPlan:
         return len(self.panels)
 
 
+def channel_order_key(filter_name: str) -> tuple[int, str]:
+    """The order build_plan gives a dataset's channels."""
+    return FILTER_ORDER.get(normalized_text(filter_name), 100), normalized_text(filter_name)
+
+
 def _dataclass_from_dict(cls: type, data: Any) -> Any:
     """Construct ``cls`` from the dataclass fields present in ``data``."""
     names = {item.name for item in fields(cls)}
@@ -1576,14 +1581,10 @@ class ProcessingPlan:
         for data in payload.get("datasets", []):
             values = dict(data)
             # Manifests are written with sorted keys, which loses the filter
-            # order. Subgroup ids are numbered in planning order, so the
-            # lowest id of each filter restores it (it drives asset naming).
+            # order; it drives asset naming, so rebuild it exactly as
+            # build_plan orders channels.
             ordered = sorted(
-                data.get("channels", {}).items(),
-                key=lambda item: min(
-                    (natural_key(group.get("subgroup_id", "")) for group in item[1]),
-                    default=(),
-                ),
+                data.get("channels", {}).items(), key=lambda item: channel_order_key(item[0])
             )
             values["channels"] = {
                 filter_name: [subgroup(group) for group in groups]
@@ -2673,7 +2674,7 @@ def build_plan(
 
         sorted_channels = dict(sorted(
             channels.items(),
-            key=lambda item: (FILTER_ORDER.get(normalized_text(item[0]), 100), normalized_text(item[0])),
+            key=lambda item: channel_order_key(item[0]),
         ))
         # The clustering summary is displayed in the Run Log and panel column;
         # only actionable panel-detection problems belong in the warning list.
@@ -4745,6 +4746,47 @@ def collect_file_stats(plan: "ProcessingPlan") -> tuple[FileStats, list[str]]:
     return stats, missing
 
 
+def legacy_stage_fingerprints(plan_payload: Any) -> dict[str, str]:
+    """Fingerprints of the plan an old (pre-checkpoint) run was made with.
+
+    Lights use the size/mtime recorded when that run was planned, so a light
+    replaced since then is noticed. Calibration files have no recorded stats
+    and use fresh ones.
+    """
+    try:
+        legacy = ProcessingPlan.from_dict(plan_payload)
+    except Exception:
+        return {}
+    stats, _missing = collect_file_stats(legacy)
+    for dataset in legacy.datasets:
+        for groups in dataset.channels.values():
+            for group in groups:
+                for frame in group.frames:
+                    if frame.mtime_ns:  # 0 means the scan recorded nothing
+                        stats[frame.path] = (frame.size, frame.mtime_ns)
+    return {spec.stage_id: spec.fingerprint for spec in stage_graph(legacy, stats)}
+
+
+def legacy_adoptable(
+    spec: "StageSpec", run_dir: Path, legacy_fingerprints: dict[str, str]
+) -> bool:
+    """Whether an old run's output may stand in for ``spec`` without a checkpoint.
+
+    Only calibration masters and mosaic panel stacks qualify (single-panel
+    masters may already have been flipped or solved), only when every output
+    exists, and only when the old run used the same inputs and settings.
+    """
+    if spec.kind not in {"calibration", "panel"} or not spec.outputs:
+        return False
+    if spec.kind == "panel" and not all(
+        output.as_posix().startswith("masters/panels/") for output in spec.outputs
+    ):
+        return False
+    if legacy_fingerprints.get(spec.stage_id) != spec.fingerprint:
+        return False
+    return all((run_dir / output).is_file() for output in spec.outputs)
+
+
 def _stage_fingerprint(
     kind: str, options: PlanOptions, inputs: Any, upstream: Iterable["StageSpec"]
 ) -> str:
@@ -4900,6 +4942,9 @@ def stage_graph(plan: "ProcessingPlan", stats: FileStats) -> list[StageSpec]:
                     name for name in panel_filters if plan.channel_uses_drizzle(dataset, name)
                 ),
                 "panel_count": dataset.panel_count,
+                "true_cfa_drizzle": dataset_uses_true_cfa_drizzle(
+                    dataset, plan.drizzle_channels, options
+                ),
             }
             spec = StageSpec(
                 f"panel:{dataset.dataset_id}:{panel_id}", "panel",
@@ -5054,11 +5099,8 @@ def summarize_run(run_dir: Path, active_run_dir: Optional[Path] = None) -> RunSu
     panel_filters: list[tuple[str, str, list[str]]] = []
     for dataset in datasets:
         panels: dict[str, list[str]] = {}
-        channels = sorted(  # manifests sort keys; subgroup ids keep planning order
-            (dataset.get("channels") or {}).items(),
-            key=lambda item: min(
-                (natural_key(group.get("subgroup_id", "")) for group in item[1]), default=()
-            ),
+        channels = sorted(  # manifests sort keys; restore build_plan's order
+            (dataset.get("channels") or {}).items(), key=lambda item: channel_order_key(item[0])
         )
         for filter_name, groups in channels:
             if filter_name not in filters:
@@ -5155,6 +5197,7 @@ def preview_resume(run_dir: Path, plan: "ProcessingPlan") -> ResumePreview:
         manifest = {}
     checkpoints = manifest.get("checkpoints") or {}
     legacy = "checkpoints" not in manifest
+    legacy_fingerprints = legacy_stage_fingerprints(manifest.get("plan") or {}) if legacy else {}
 
     def absolute(item: str) -> Path:
         return Path(item) if Path(item).is_absolute() else run_dir / Path(item)
@@ -5166,10 +5209,7 @@ def preview_resume(run_dir: Path, plan: "ProcessingPlan") -> ResumePreview:
         return all(absolute(item).is_file() for item in record.get("outputs", []))
 
     def adoptable(spec: StageSpec) -> bool:
-        return (
-            legacy and spec.kind in {"calibration", "panel"} and bool(spec.outputs)
-            and all((run_dir / output).is_file() for output in spec.outputs)
-        )
+        return legacy and legacy_adoptable(spec, run_dir, legacy_fingerprints)
 
     decision: dict[str, bool] = {}  # stage id -> reused?
 
@@ -5317,6 +5357,7 @@ class PipelineEngine:
         self._session_commands_start = 0
         self.stages: dict[str, StageSpec] = {}
         self.adopt_legacy = False
+        self.legacy_fingerprints: dict[str, str] = {}
         self.reused_stage_ids: list[str] = []
         self.ran_stage_ids: list[str] = []
 
@@ -6844,6 +6885,21 @@ class PipelineEngine:
                     process_root,
                 ],
             )
+            if self.plan.options.rolling_cleanup:
+                spent = [
+                    self.run_dir / "inputs" / dataset.dataset_id / f"mosaic_tiles_{mode}",
+                    *(
+                        path for path in process_root.iterdir()
+                        if path.name != "stitched"
+                    ),
+                ] if process_root.is_dir() else []
+                spent = [path for path in spent if path.exists()]
+                if spent:
+                    self._cmd("close")
+                    self._cmd("cd", quoted(self.run_dir))
+                    self._remove_generated_paths(
+                        spent, f"Released {dataset.dataset_id} {mode} tiles after stitching"
+                    )
             destinations = [
                 self.run_dir / "masters" / f"{mosaic_output_name(self.plan, dataset, name)}.fit"
                 for name in filters
@@ -7204,13 +7260,12 @@ class PipelineEngine:
             self.reused_stage_ids.append(stage_id)
             self.log_callback(f"Reused {spec.label}.")
             return self._absolute_outputs(self.manifest["checkpoints"][stage_id]["outputs"])
-        if self.adopt_legacy and spec.kind in {"calibration", "panel"}:
+        if self.adopt_legacy and legacy_adoptable(spec, self.run_dir, self.legacy_fingerprints):
             expected = [self.run_dir / output for output in spec.outputs]
-            if expected and all(path.is_file() for path in expected):
-                self._record_checkpoint(stage_id, expected)
-                self.reused_stage_ids.append(stage_id)
-                self.log_callback(f"Adopted {spec.label} from the earlier attempt.")
-                return expected
+            self._record_checkpoint(stage_id, expected)
+            self.reused_stage_ids.append(stage_id)
+            self.log_callback(f"Adopted {spec.label} from the earlier attempt.")
+            return expected
         if work is None:
             raise RuntimeError(f"The earlier result of {spec.label} is missing.")
         leftovers = [path for path in workspaces if path.exists()]
@@ -7488,6 +7543,9 @@ class PipelineEngine:
         stats, _missing = collect_file_stats(self.plan)
         self.stages = {spec.stage_id: spec for spec in stage_graph(self.plan, stats)}
         self.adopt_legacy = previous is not None and "checkpoints" not in previous
+        if self.adopt_legacy:
+            assert previous is not None
+            self.legacy_fingerprints = legacy_stage_fingerprints(previous.get("plan") or {})
         self.manifest.setdefault("checkpoints", {})
         self.manifest["sessions"].append({
             "version": VERSION,
@@ -8980,6 +9038,8 @@ class MainWindow(QMainWindow):
     def _load_profile(self, name: str) -> None:
         if not name:
             return
+        if getattr(self, "resume_run_dir", None) is not None:
+            self.exit_resume_mode()
         self._loading_profile = True
         profile = self.store.profile(name)
         self._apply_profile_values(profile)
@@ -9614,6 +9674,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, APP_NAME, "Build a valid calibration plan first.")
             return
         if self.resume_run_dir is not None:
+            if not self._resume_plan_matches_run():
+                return
             if not self._confirm_resume():
                 return
             self._launch_pipeline(self.resume_run_dir)
@@ -9652,7 +9714,9 @@ class MainWindow(QMainWindow):
 
     def _launch_pipeline(self, resume_dir: Optional[Path]) -> None:
         assert self.current_plan is not None
-        self._save_profile()
+        if resume_dir is None:
+            # A resumed run's settings came from its folder, not this profile.
+            self._save_profile()
         self.tabs.setCurrentIndex(3)
         self.progress_bar.setValue(0)
         self.scan_button.setEnabled(False)
@@ -9999,6 +10063,38 @@ class MainWindow(QMainWindow):
         self.run_index.add(Path(path))
         if self.recent_runs_window is not None and self.recent_runs_window.isVisible():
             self.recent_runs_window.refresh()
+
+    def _resume_plan_matches_run(self) -> bool:
+        """Refuse to continue a run folder with a plan for something else."""
+        assert self.current_plan is not None and self.resume_run_dir is not None
+        try:
+            original = json.loads(
+                (self.resume_run_dir / "manifest.json").read_text(encoding="utf-8")
+            ).get("plan") or {}
+        except (OSError, ValueError):
+            original = {}
+        plan = self.current_plan
+        reasons = []
+        if plan.master_merge is not None:
+            reasons.append("the current plan is a master merge")
+        if plan.target_name != original.get("target_name"):
+            reasons.append(
+                f"its target is “{plan.target_name}”, not “{original.get('target_name')}”"
+            )
+        if os.path.normcase(str(plan.input_root)) != os.path.normcase(
+            str(original.get("input_root", ""))
+        ):
+            reasons.append("its input folder is different")
+        if not reasons:
+            return True
+        QMessageBox.warning(
+            self, APP_NAME,
+            f"The current plan is for a different job than {self.resume_run_dir.name}: "
+            + "; ".join(reasons)
+            + ".\n\nCancel resume to process it as a new run, or resume the run again "
+            "from Recent runs.",
+        )
+        return False
 
     def _confirm_resume(self) -> bool:
         assert self.current_plan is not None and self.resume_run_dir is not None
