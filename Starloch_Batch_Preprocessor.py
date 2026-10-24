@@ -611,7 +611,6 @@ class PanelOutline:
     height_deg: float
     angle_deg: Optional[float]
     corners: list[tuple[float, float]]
-    frame_points: list[tuple[float, float]]
     filter_counts: dict[str, int]
     missing_filters: list[str]
     overlaps: dict[str, float] = field(default_factory=dict)
@@ -742,7 +741,6 @@ def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
             "centre": _mean_direction([
                 (frame.pointing_ra_deg, frame.pointing_dec_deg) for frame in preferred
             ]),
-            "frames": [(frame.pointing_ra_deg, frame.pointing_dec_deg) for frame in preferred],
             "sizes": sizes,
             # Axial mean: an outline is the same rotated by 180 degrees, and
             # plate-solved frames from both sides of a meridian flip differ
@@ -799,12 +797,6 @@ def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
             corner_xi = xi + sx * width / 2 * x_axis[0] + sy * height / 2 * y_axis[0]
             corner_eta = eta + sx * width / 2 * x_axis[1] + sy * height / 2 * y_axis[1]
             corners.append((-corner_xi, corner_eta))
-        points = []
-        for ra, dec in entry["frames"]:
-            if _separation_deg((ra, dec), projection_centre) > FAR_PANEL_DEG:
-                continue
-            frame_xi, frame_eta = _gnomonic(ra, dec, projection_centre)
-            points.append((-frame_xi, frame_eta))
         digits = re.findall(r"\d+", entry["panel_id"])
         panels.append(PanelOutline(
             panel_id=entry["panel_id"],
@@ -815,7 +807,6 @@ def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
             height_deg=height,
             angle_deg=entry["angle"],
             corners=corners,
-            frame_points=points,
             filter_counts=entry["counts"],
             missing_filters=entry["missing"],
         ))
@@ -6897,11 +6888,6 @@ class _PanelCanvas(QWidget):
             painter.drawText(
                 polygon.boundingRect(), Qt.AlignmentFlag.AlignCenter, label
             )
-            if self.owner.frames_check.isChecked():
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QBrush(color))
-                for x, y in panel.frame_points:
-                    painter.drawEllipse(QPointF(*self.to_widget(x, y)), 2.0, 2.0)
         painter.end()
 
     def mouseMoveEvent(self, event: Any) -> None:  # noqa: N802 - Qt API name
@@ -6927,12 +6913,9 @@ class PanelMapWindow(QWidget):
         layout = QVBoxLayout(self)
         self.dataset_combo = QComboBox()
         self.dataset_combo.currentIndexChanged.connect(self._dataset_changed)
-        self.frames_check = QCheckBox("Show individual frames")
-        self.frames_check.toggled.connect(lambda _checked: self.canvas.update())
         top = QHBoxLayout()
         top.addWidget(self.dataset_combo)
         top.addStretch(1)
-        top.addWidget(self.frames_check)
         layout.addLayout(top)
         self.canvas = _PanelCanvas(self)
         layout.addWidget(self.canvas, 1)
