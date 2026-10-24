@@ -4954,6 +4954,269 @@ def stage_graph(plan: "ProcessingPlan", stats: FileStats) -> list[StageSpec]:
     return specs
 
 
+# --- Recent runs ------------------------------------------------------------------
+
+
+class RunIndex:
+    """SBPP's own list of run folders started on this computer, newest first."""
+
+    MAX_ENTRIES = 50
+
+    def __init__(self, config_dir: Path):
+        self.path = Path(config_dir) / "runs.json"
+
+    def run_dirs(self) -> list[Path]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            return [Path(item) for item in payload.get("runs", [])]
+        except (OSError, ValueError, AttributeError):
+            return []
+
+    @staticmethod
+    def _key(path: Path) -> str:
+        try:
+            return os.path.normcase(str(Path(path).resolve()))
+        except OSError:
+            return os.path.normcase(os.path.abspath(str(path)))
+
+    def _save(self, run_dirs: list[Path]) -> None:
+        atomic_write_json(self.path, {"runs": [str(path) for path in run_dirs]})
+
+    def add(self, run_dir: Path) -> None:
+        key = self._key(run_dir)
+        resolved = Path(os.path.normpath(os.path.abspath(str(run_dir))))
+        kept = [path for path in self.run_dirs() if self._key(path) != key]
+        self._save(([resolved] + kept)[: self.MAX_ENTRIES])
+
+    def remove(self, run_dir: Path) -> None:
+        key = self._key(run_dir)
+        self._save([path for path in self.run_dirs() if self._key(path) != key])
+
+
+@dataclass
+class RunSummary:
+    run_dir: Path
+    exists: bool
+    status: str
+    target: str
+    detail: str
+    started: str
+    total_time: str
+    progress: str
+    error: str
+    resumable: bool
+    is_master_merge: bool
+    version: str
+
+
+def _failed_stage_words(manifest: dict[str, Any]) -> str:
+    trace = str(manifest.get("traceback") or "")
+    commands = manifest.get("commands") or []
+    last = str(commands[-1]) if commands else ""
+    word = last.split(" ", 1)[0]
+    if "_finalize_mosaic_geometry" in trace or "largest_common_valid_crop" in trace:
+        return "final crop"
+    if "mirrorx" in trace or word == "mirrorx" or "_normalize_output_orientation" in trace:
+        return "orientation"
+    if word in {"seqplatesolve", "platesolve"}:
+        return "plate solving"
+    if word == "stack":
+        return "stitching" if "-maximize" in last else "stacking"
+    if word in {"register", "seqapplyreg"}:
+        return "registration"
+    if word == "calibrate":
+        return "calibration"
+    return str(manifest.get("error") or "unknown step")[:60]
+
+
+def summarize_run(run_dir: Path, active_run_dir: Optional[Path] = None) -> RunSummary:
+    """Plain-language description of a run folder for the Recent runs list."""
+    run_dir = Path(run_dir)
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return RunSummary(
+            run_dir, False, "Missing", run_dir.name, "", "", "", "", "", False, False, ""
+        )
+    plan = manifest.get("plan") or {}
+    datasets = plan.get("datasets") or []
+    is_merge = bool(plan.get("master_merge"))
+    status = {
+        "complete": "Complete", "failed": "Failed", "cancelled": "Stopped",
+    }.get(str(manifest.get("status")), "Interrupted")
+    if manifest.get("status") == "running" and (
+        RunLock.is_fresh(run_dir)
+        or (active_run_dir is not None and RunIndex._key(active_run_dir) == RunIndex._key(run_dir))
+    ):
+        status = "Running"
+
+    filters: list[str] = []
+    panel_filters: list[tuple[str, str, list[str]]] = []
+    for dataset in datasets:
+        panels: dict[str, list[str]] = {}
+        channels = sorted(  # manifests sort keys; subgroup ids keep planning order
+            (dataset.get("channels") or {}).items(),
+            key=lambda item: min(
+                (natural_key(group.get("subgroup_id", "")) for group in item[1]), default=()
+            ),
+        )
+        for filter_name, groups in channels:
+            if filter_name not in filters:
+                filters.append(filter_name)
+            for group in groups:
+                panels.setdefault(group.get("panel_id", ""), [])
+                if filter_name not in panels[group.get("panel_id", "")]:
+                    panels[group.get("panel_id", "")].append(filter_name)
+        for panel_id, names in panels.items():
+            panel_filters.append((dataset.get("dataset_id", ""), panel_id, names))
+    if is_merge:
+        merge_filters = plan["master_merge"].get("filters") or []
+        detail = "master merge · " + "/".join(merge_filters)
+    else:
+        parts = [f"{len(panel_filters)} panel{'s' if len(panel_filters) != 1 else ''}"]
+        if filters:
+            parts.append("/".join(filters))
+        if plan.get("integration_time"):
+            parts.append(str(plan["integration_time"]))
+        detail = " · ".join(parts)
+
+    started = ""
+    created = manifest.get("created_utc") or (manifest.get("timing") or {}).get("started_utc")
+    if created:
+        try:
+            started = datetime.fromisoformat(str(created)).astimezone().strftime("%b %d, %H:%M")
+        except ValueError:
+            started = str(created)
+    sessions = manifest.get("sessions") or []
+    seconds = sum(float(item.get("elapsed_seconds") or 0.0) for item in sessions) if sessions \
+        else float((manifest.get("timing") or {}).get("elapsed_seconds") or 0.0)
+
+    checkpoints = manifest.get("checkpoints")
+    if status == "Complete":
+        progress = "finished"
+    elif is_merge:
+        progress = "master merge"
+    else:
+        if checkpoints is not None:
+            done = sum(1 for key in checkpoints if key.startswith("panel:"))
+            stitched = any(key.startswith("stitch:") for key in checkpoints)
+        else:
+            done = 0
+            counts = Counter(ds for ds, _panel, _names in panel_filters)
+            for dataset_id, panel_id, names in panel_filters:
+                if counts[dataset_id] > 1:
+                    folder = run_dir / "masters" / "panels" / dataset_id / panel_id
+                    paths = [folder / f"{final_filter_stem(name)}.fit" for name in names]
+                else:
+                    paths = [run_dir / "masters" / f"{final_filter_stem(name)}.fit" for name in names]
+                done += all(path.is_file() for path in paths)
+            stitched = False
+        progress = f"{done}/{len(panel_filters)} panels stacked"
+        if stitched:
+            progress += " · stitched"
+    if status == "Failed":
+        progress += f" · failed: {_failed_stage_words(manifest)}"
+    return RunSummary(
+        run_dir=run_dir,
+        exists=True,
+        status=status,
+        target=str(plan.get("target_name") or run_dir.name),
+        detail=detail,
+        started=started,
+        total_time=human_duration(seconds),
+        progress=progress,
+        error=str(manifest.get("error") or ""),
+        resumable=status in {"Failed", "Stopped", "Interrupted"} and not is_merge,
+        is_master_merge=is_merge,
+        version=str(manifest.get("application_version") or ""),
+    )
+
+
+@dataclass
+class ResumePreview:
+    reused: list[str]
+    redo: list[str]
+    missing_inputs: list[str]
+
+
+def preview_resume(run_dir: Path, plan: "ProcessingPlan") -> ResumePreview:
+    """What resuming ``run_dir`` with ``plan`` would reuse and redo (runs nothing).
+
+    Mirrors PipelineEngine's demand-driven reuse: stages whose results are not
+    needed because a later stage is still valid are not listed at all.
+    """
+    run_dir = Path(run_dir)
+    stats, missing = collect_file_stats(plan)
+    specs = stage_graph(plan, stats)
+    by_id = {spec.stage_id: spec for spec in specs}
+    try:
+        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    checkpoints = manifest.get("checkpoints") or {}
+    legacy = "checkpoints" not in manifest
+
+    def absolute(item: str) -> Path:
+        return Path(item) if Path(item).is_absolute() else run_dir / Path(item)
+
+    def valid(stage_id: str) -> bool:
+        spec, record = by_id.get(stage_id), checkpoints.get(stage_id)
+        if spec is None or not record or record.get("fingerprint") != spec.fingerprint:
+            return False
+        return all(absolute(item).is_file() for item in record.get("outputs", []))
+
+    def adoptable(spec: StageSpec) -> bool:
+        return (
+            legacy and spec.kind in {"calibration", "panel"} and bool(spec.outputs)
+            and all((run_dir / output).is_file() for output in spec.outputs)
+        )
+
+    decision: dict[str, bool] = {}  # stage id -> reused?
+
+    def visit(stage_id: str) -> None:
+        if stage_id in decision or stage_id not in by_id:
+            return
+        spec = by_id[stage_id]
+        decision[stage_id] = valid(stage_id) or adoptable(spec)
+        if not decision[stage_id] and spec.kind in {"calibration", "panel"}:
+            for upstream in spec.upstream:
+                if upstream.startswith("calibration:"):
+                    visit(upstream)
+
+    for dataset in plan.datasets:
+        final_id = f"final:{dataset.dataset_id}"
+        if valid(final_id):
+            decision[final_id] = True
+            continue
+        mosaic = dataset.panel_count > 1 and plan.options.mosaic_enabled
+        modes = [
+            spec.stage_id.split(":")[2] for spec in specs
+            if spec.kind == "geometry" and spec.stage_id.split(":")[1] == dataset.dataset_id
+        ]
+        geometry = [f"geometry:{dataset.dataset_id}:{mode}" for mode in modes]
+        stitch = [f"stitch:{dataset.dataset_id}:{mode}" for mode in modes]
+        if mosaic and geometry and all(valid(stage) for stage in geometry):
+            decision.update({stage: True for stage in geometry})
+        else:
+            if not mosaic or not all(valid(g) or valid(s) for g, s in zip(geometry, stitch)):
+                for panel_id in dataset.panels:
+                    visit(f"panel:{dataset.dataset_id}:{panel_id}")
+            for geometry_id, stitch_id in zip(geometry, stitch):
+                if valid(geometry_id):
+                    decision[geometry_id] = True
+                    continue
+                decision[stitch_id] = valid(stitch_id)
+                decision[geometry_id] = False
+        decision[final_id] = False
+
+    ordered = [spec for spec in specs if spec.stage_id in decision]
+    return ResumePreview(
+        reused=[spec.label for spec in ordered if decision[spec.stage_id]],
+        redo=[spec.label for spec in ordered if not decision[spec.stage_id]],
+        missing_inputs=missing,
+    )
+
+
 class RunLocked(RuntimeError):
     """Another SBPP window appears to be processing this run folder."""
 
@@ -7121,6 +7384,13 @@ class PipelineEngine:
         """Process the plan in a new run folder, or continue ``resume_dir``."""
         if not self.plan.valid:
             raise RuntimeError("The processing plan contains blocking calibration errors.")
+        if resume_dir is not None:
+            _stats, missing = collect_file_stats(self.plan)
+            if missing:
+                raise RuntimeError(
+                    f"Cannot resume: {len(missing)} input file(s) are missing, "
+                    f"for example {missing[0]}. Reconnect the drive or rescan."
+                )
         try:
             return self._run(resume_dir)
         finally:
