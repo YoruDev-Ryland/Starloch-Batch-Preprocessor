@@ -1575,9 +1575,19 @@ class ProcessingPlan:
         datasets = []
         for data in payload.get("datasets", []):
             values = dict(data)
+            # Manifests are written with sorted keys, which loses the filter
+            # order. Subgroup ids are numbered in planning order, so the
+            # lowest id of each filter restores it (it drives asset naming).
+            ordered = sorted(
+                data.get("channels", {}).items(),
+                key=lambda item: min(
+                    (natural_key(group.get("subgroup_id", "")) for group in item[1]),
+                    default=(),
+                ),
+            )
             values["channels"] = {
                 filter_name: [subgroup(group) for group in groups]
-                for filter_name, groups in data.get("channels", {}).items()
+                for filter_name, groups in ordered
             }
             datasets.append(_dataclass_from_dict(DatasetPlan, values))
         merge = None
@@ -4701,6 +4711,13 @@ def mosaic_output_name(plan: "ProcessingPlan", dataset: DatasetPlan, filter_name
     return name
 
 
+def calibration_stage_id(choice: CalibrationChoice, *extra: Any) -> str:
+    digest = hashlib.sha1(
+        json.dumps([*choice.key, *extra], default=str).encode("utf-8")
+    ).hexdigest()[:12]
+    return f"calibration:{choice.kind}:{digest}"
+
+
 def _plan_input_paths(plan: "ProcessingPlan") -> list[str]:
     paths: dict[str, None] = {}
     for dataset in plan.datasets:
@@ -4760,12 +4777,6 @@ def stage_graph(plan: "ProcessingPlan", stats: FileStats) -> list[StageSpec]:
     def choice_inputs(choice: CalibrationChoice) -> dict[str, Any]:
         return {"kind": choice.kind, "mode": choice.mode, "files": files(choice.files)}
 
-    def asset_id(choice: CalibrationChoice, *extra: Any) -> str:
-        digest = hashlib.sha1(
-            json.dumps([*choice.key, *extra], default=str).encode("utf-8")
-        ).hexdigest()[:12]
-        return f"calibration:{choice.kind}:{digest}"
-
     def calibration_stage(
         choice: CalibrationChoice, output: Path, text: str,
         upstream: list[StageSpec], extra_inputs: Optional[dict[str, Any]] = None,
@@ -4773,7 +4784,7 @@ def stage_graph(plan: "ProcessingPlan", stats: FileStats) -> list[StageSpec]:
     ) -> StageSpec:
         inputs = {"choice": choice_inputs(choice), **(extra_inputs or {})}
         spec = StageSpec(
-            asset_id(choice, *key_extra), "calibration",
+            calibration_stage_id(choice, *key_extra), "calibration",
             _stage_fingerprint("calibration", options, inputs, upstream),
             [output], text, [item.stage_id for item in upstream],
         )
@@ -5039,6 +5050,10 @@ class PipelineEngine:
         self._lock: Optional[RunLock] = None
         self._commands_prefix = ""
         self._session_commands_start = 0
+        self.stages: dict[str, StageSpec] = {}
+        self.adopt_legacy = False
+        self.reused_stage_ids: list[str] = []
+        self.ran_stage_ids: list[str] = []
 
     def _log(self, message: str) -> None:
         """Show a line in the UI and append it to the run's sbpp.log.
@@ -5473,16 +5488,35 @@ class PipelineEngine:
             self.assets[choice.key] = source
             return source
         output = self.run_dir / "masters" / f"imported_{slugify(label)}.fit"
-        self._cmd("load", quoted(source))
-        self._cmd("save", quoted(output))
-        self._cmd("close")
-        self.assets[choice.key] = output
-        self._tick(f"Converted external master {source.name} to FITS.")
-        return output
+
+        def convert() -> list[Path]:
+            self._cmd("load", quoted(source))
+            self._cmd("save", quoted(output))
+            self._cmd("close")
+            self._tick(f"Converted external master {source.name} to FITS.")
+            return [output]
+
+        result = self._reuse_or_run(calibration_stage_id(choice), convert)[0]
+        self.assets[choice.key] = result
+        return result
 
     def _build_master(self, choice: CalibrationChoice, label: str) -> Path:
         if choice.key in self.assets:
             return self.assets[choice.key]
+        assert self.run_dir is not None
+        job = slugify(label)
+        output = self._reuse_or_run(
+            calibration_stage_id(choice),
+            lambda: [self._build_master_now(choice, label)],
+            [
+                self.run_dir / "inputs" / "calibration" / job,
+                self.run_dir / "process" / "calibration" / job,
+            ],
+        )[0]
+        self.assets[choice.key] = output
+        return output
+
+    def _build_master_now(self, choice: CalibrationChoice, label: str) -> Path:
         assert self.run_dir is not None
         job = slugify(label)
         staging = self.run_dir / "inputs" / "calibration" / job
@@ -5538,6 +5572,22 @@ class PipelineEngine:
         cache_key = (*choice.key, hot_sigma)
         if cache_key in self.asset_bpm:
             return self.asset_bpm[cache_key]
+        stage_id = calibration_stage_id(choice, "bpm", hot_sigma)
+        if stage_id in self.stages:
+            produced = self._reuse_or_run(
+                stage_id,
+                lambda: [path for path in [self._build_bpm_now(choice, label, hot_sigma)] if path],
+            )
+            bpm_path = produced[0] if produced else None
+        else:
+            bpm_path = self._build_bpm_now(choice, label, hot_sigma)
+        if bpm_path is not None:
+            self.asset_bpm[cache_key] = bpm_path
+        return bpm_path
+
+    def _build_bpm_now(
+        self, choice: CalibrationChoice, label: str, hot_sigma: str
+    ) -> Optional[Path]:
         dark_master = self._resolve_simple_asset(choice, f"{label}_dark_for_bpm")
         if dark_master is None:
             return None
@@ -5550,7 +5600,6 @@ class PipelineEngine:
         self._cmd("find_hot", quoted(bpm_base), "5", hot_sigma)
         self._cmd("close")
         bpm_path = bpm_base.with_suffix(".lst")
-        self.asset_bpm[cache_key] = bpm_path
         self._tick(f"Created BPM from {dark_master.name}.")
         return bpm_path
 
@@ -5567,6 +5616,26 @@ class PipelineEngine:
             return self.assets[choice.key]
         if choice.mode == "master":
             return self._materialize_master(choice, label)
+        assert self.run_dir is not None
+        job = slugify(label)
+        output = self._reuse_or_run(
+            calibration_stage_id(choice),
+            lambda: [self._build_flat_now(choice, bias_master, darkflat_master, label)],
+            [
+                self.run_dir / "inputs" / "calibration" / job,
+                self.run_dir / "process" / "calibration" / job,
+            ],
+        )[0]
+        self.assets[choice.key] = output
+        return output
+
+    def _build_flat_now(
+        self,
+        choice: CalibrationChoice,
+        bias_master: Optional[Path],
+        darkflat_master: Optional[Path],
+        label: str,
+    ) -> Path:
         assert self.run_dir is not None
         job = slugify(label)
         staging = self.run_dir / "inputs" / "calibration" / job
@@ -5953,10 +6022,14 @@ class PipelineEngine:
         outputs: list[Path],
         mode_name: str,
         process_root: Path,
+        destinations: list[Path],
     ) -> list[Path]:
-        """Verify or align filter mosaics and apply one shared safe crop."""
+        """Crop the stitched ``outputs`` to one shared safe area into ``destinations``.
+
+        The stitched sources are never modified, so this stage can be redone.
+        """
         if not outputs:
-            return outputs
+            return []
         process = process_root / "final_geometry"
         process.mkdir(parents=True, exist_ok=True)
         base = f"mosaic_products_{mode_name}"
@@ -6047,7 +6120,7 @@ class PipelineEngine:
         x, y, width, height = crop
         temporary_outputs: list[tuple[Path, Path]] = []
         try:
-            for source, output in zip(aligned_paths, outputs):
+            for source, output in zip(aligned_paths, destinations):
                 temporary = output.with_name(
                     f"{output.stem}_final_geometry_tmp.fit"
                 )
@@ -6089,7 +6162,7 @@ class PipelineEngine:
             },
         }
         self._verify_outputs(
-            outputs, f"Finalizing {dataset.dataset_id} {mode_name} mosaic geometry"
+            destinations, f"Finalizing {dataset.dataset_id} {mode_name} mosaic geometry"
         )
         alignment_text = (
             "Verified shared astrometric grid and cropped"
@@ -6102,7 +6175,7 @@ class PipelineEngine:
             f"{alignment_text} {count} {mode_name} filter mosaic(s) "
             f"to {width}×{height}."
         )
-        return outputs
+        return destinations
 
     def _solve_mosaic_tiles(
         self,
@@ -6454,9 +6527,9 @@ class PipelineEngine:
             tile_count = end - start + 1
             self._cmd("unselect", aligned, "1", str(count))
             self._cmd("select", aligned, str(start), str(end))
-            output = self.run_dir / "masters" / self._mosaic_output_name(
-                dataset, filter_name, drizzle_mode
-            )
+            stitched = process_root / "stitched"
+            stitched.mkdir(parents=True, exist_ok=True)
+            output = stitched / self._mosaic_output_name(dataset, filter_name, drizzle_mode)
             args = [
                 "stack", aligned, "rej", "none", "-norm=addscale",
                 "-filter-included", "-maximize", "-32b",
@@ -6475,15 +6548,6 @@ class PipelineEngine:
         self._verify_outputs(
             outputs, f"Stitching {dataset.dataset_id} {mode_name} mosaics"
         )
-        outputs = self._finalize_mosaic_geometry(
-            dataset, outputs, mode_name, process_root
-        )
-        if self.plan.options.rolling_cleanup:
-            self._cmd("close")
-            self._remove_generated_paths(
-                [staging, process_root],
-                f"Released verified {dataset.dataset_id} {mode_name} mosaic workspace",
-            )
         return outputs
 
     def _stitch_dataset_mosaics(
@@ -6491,31 +6555,43 @@ class PipelineEngine:
         dataset: DatasetPlan,
         panel_outputs: dict[str, dict[str, Path]],
     ) -> list[Path]:
-        """Stitch native and drizzle filters without mixing their pixel scales."""
-        native_filters = [
-            filter_name for filter_name in dataset.channels
-            if not self.plan.channel_uses_drizzle(dataset, filter_name)
-        ]
-        drizzle_filters = [
-            filter_name for filter_name in dataset.channels
-            if self.plan.channel_uses_drizzle(dataset, filter_name)
-        ]
+        """Stitch native and drizzle filters without mixing their pixel scales.
+
+        Stitching and the shared crop are separate stages: the uncropped
+        stitched mosaics stay in process/<ds>/mosaic_<mode>/stitched, so a
+        failed or changed crop can be redone without stitching again.
+        """
+        assert self.run_dir is not None
         outputs: list[Path] = []
-        if native_filters:
-            outputs.extend(self._stitch_mosaic_mode(
-                dataset, panel_outputs, native_filters, False
-            ))
-        if drizzle_filters:
-            outputs.extend(self._stitch_mosaic_mode(
-                dataset, panel_outputs, drizzle_filters, True
+        for drizzle, filters, mode in self._mosaic_modes(dataset):
+            geometry_id = f"geometry:{dataset.dataset_id}:{mode}"
+            if self._stage_valid(geometry_id):
+                outputs.extend(self._reuse_or_run(geometry_id, None))
+                continue
+            process_root = self.run_dir / "process" / dataset.dataset_id / f"mosaic_{mode}"
+            stitched = self._reuse_or_run(
+                f"stitch:{dataset.dataset_id}:{mode}",
+                lambda filters=filters, drizzle=drizzle: self._stitch_mosaic_mode(
+                    dataset, panel_outputs, filters, drizzle
+                ),
+                [
+                    self.run_dir / "inputs" / dataset.dataset_id / f"mosaic_tiles_{mode}",
+                    process_root,
+                ],
+            )
+            destinations = [
+                self.run_dir / "masters" / f"{mosaic_output_name(self.plan, dataset, name)}.fit"
+                for name in filters
+            ]
+            outputs.extend(self._reuse_or_run(
+                geometry_id,
+                lambda stitched=stitched, destinations=destinations, mode=mode,
+                process_root=process_root: self._finalize_mosaic_geometry(
+                    dataset, stitched, mode, process_root, destinations
+                ),
+                [process_root / "final_geometry"],
             ))
         self._verify_outputs(outputs, f"Completing {dataset.dataset_id} mosaics")
-        if self.plan.options.rolling_cleanup:
-            assert self.run_dir is not None
-            self._remove_generated_paths(
-                [self.run_dir / "masters" / "panels" / dataset.dataset_id],
-                f"Released panel masters consumed by {dataset.dataset_id} mosaics",
-            )
         return outputs
 
     def _solve_final_master(
@@ -6815,11 +6891,160 @@ class PipelineEngine:
             )
         return self._solve_outputs("master_merge", outputs)
 
+    # --- Checkpointed stages -------------------------------------------------
+
+    def _absolute_outputs(self, outputs: Iterable[str]) -> list[Path]:
+        assert self.run_dir is not None
+        return [
+            Path(item) if Path(item).is_absolute() else self.run_dir / Path(item)
+            for item in outputs
+        ]
+
+    def _stage_valid(self, stage_id: str) -> bool:
+        spec = self.stages.get(stage_id)
+        record = self.manifest.get("checkpoints", {}).get(stage_id)
+        if spec is None or not record or record.get("fingerprint") != spec.fingerprint:
+            return False
+        return all(path.is_file() for path in self._absolute_outputs(record["outputs"]))
+
+    def _record_checkpoint(self, stage_id: str, outputs: list[Path]) -> None:
+        assert self.run_dir is not None
+        relative = []
+        for path in outputs:
+            try:
+                relative.append(Path(path).relative_to(self.run_dir).as_posix())
+            except ValueError:
+                relative.append(str(path))
+        self.manifest.setdefault("checkpoints", {})[stage_id] = {
+            "fingerprint": self.stages[stage_id].fingerprint,
+            "outputs": relative,
+            "finished_utc": utc_now(),
+        }
+        self._write_manifest()
+
+    def _reuse_or_run(
+        self,
+        stage_id: str,
+        work: Optional[Callable[[], list[Path]]],
+        workspaces: Iterable[Path] = (),
+    ) -> list[Path]:
+        """Return a stage's outputs, reusing a matching earlier result if one exists."""
+        assert self.run_dir is not None
+        spec = self.stages.get(stage_id)
+        if spec is None:
+            if work is None:
+                raise RuntimeError(f"Unknown processing stage {stage_id}.")
+            return list(work())
+        if self._stage_valid(stage_id):
+            self.reused_stage_ids.append(stage_id)
+            self.log_callback(f"Reused {spec.label}.")
+            return self._absolute_outputs(self.manifest["checkpoints"][stage_id]["outputs"])
+        if self.adopt_legacy and spec.kind in {"calibration", "panel"}:
+            expected = [self.run_dir / output for output in spec.outputs]
+            if expected and all(path.is_file() for path in expected):
+                self._record_checkpoint(stage_id, expected)
+                self.reused_stage_ids.append(stage_id)
+                self.log_callback(f"Adopted {spec.label} from the earlier attempt.")
+                return expected
+        if work is None:
+            raise RuntimeError(f"The earlier result of {spec.label} is missing.")
+        leftovers = [path for path in workspaces if path.exists()]
+        if leftovers:
+            # Siril must not be sitting inside a folder that is about to go.
+            self._cmd("cd", quoted(self.run_dir))
+            self._remove_generated_paths(
+                leftovers, f"Cleared leftovers before redoing {spec.label}"
+            )
+        outputs = list(work())
+        self._verify_outputs(outputs, f"Completing {spec.label}")
+        self._record_checkpoint(stage_id, outputs)
+        self.ran_stage_ids.append(stage_id)
+        return outputs
+
+    def _is_mosaic(self, dataset: DatasetPlan) -> bool:
+        return dataset.panel_count > 1 and self.plan.options.mosaic_enabled
+
+    def _mosaic_modes(self, dataset: DatasetPlan) -> list[tuple[bool, list[str], str]]:
+        modes = []
+        for drizzle in (False, True):
+            filters = [
+                name for name in dataset.channels
+                if self.plan.channel_uses_drizzle(dataset, name) == drizzle
+            ]
+            if filters:
+                modes.append((drizzle, filters, "drizzle" if drizzle else "native"))
+        return modes
+
+    def _panel_filters(self, dataset: DatasetPlan, panel_id: str) -> list[str]:
+        return [
+            name for name, groups in dataset.channels.items()
+            if any(group.panel_id == panel_id for group in groups)
+        ]
+
+    def _process_dataset_with_final(self, dataset: DatasetPlan) -> list[Path]:
+        final_id = f"final:{dataset.dataset_id}"
+        if self._stage_valid(final_id):
+            return self._reuse_or_run(final_id, None)
+        produced = self._process_dataset(dataset)
+        finished = self._reuse_or_run(
+            final_id, lambda: self._finalize_dataset(dataset, produced)
+        )
+        self._release_dataset_workspaces(dataset)
+        return finished
+
+    def _finalize_dataset(self, dataset: DatasetPlan, outputs: list[Path]) -> list[Path]:
+        """Final plate solve (ordinary stacks) and orientation; safe to repeat."""
+        if not self._is_mosaic(dataset):
+            outputs = self._solve_non_mosaic_outputs(dataset, outputs)
+        return self._normalize_output_orientation(dataset.dataset_id, outputs)
+
+    def _release_dataset_workspaces(self, dataset: DatasetPlan) -> None:
+        """Rolling cleanup of mosaic inputs, kept until the final products exist."""
+        if not self.plan.options.rolling_cleanup or not self._is_mosaic(dataset):
+            return
+        assert self.run_dir is not None
+        paths = []
+        for _drizzle, _filters, mode in self._mosaic_modes(dataset):
+            paths.append(self.run_dir / "inputs" / dataset.dataset_id / f"mosaic_tiles_{mode}")
+            paths.append(self.run_dir / "process" / dataset.dataset_id / f"mosaic_{mode}")
+        paths.append(self.run_dir / "masters" / "panels" / dataset.dataset_id)
+        existing = [path for path in paths if path.exists()]
+        if existing:
+            self._cmd("close")
+            self._cmd("cd", quoted(self.run_dir))
+            self._remove_generated_paths(
+                existing, f"Released {dataset.dataset_id} mosaic workspaces"
+            )
+
     def _process_dataset(self, dataset: DatasetPlan) -> list[Path]:
         assert self.run_dir is not None
+        mosaic = self._is_mosaic(dataset)
+        modes = self._mosaic_modes(dataset) if mosaic else []
+        geometry_ids = [f"geometry:{dataset.dataset_id}:{mode}" for _d, _f, mode in modes]
+        stitch_ids = [f"stitch:{dataset.dataset_id}:{mode}" for _d, _f, mode in modes]
+        if mosaic and all(self._stage_valid(stage) for stage in geometry_ids):
+            return [path for stage in geometry_ids for path in self._reuse_or_run(stage, None)]
+        need_panels = not mosaic or not all(
+            self._stage_valid(geometry) or self._stage_valid(stitch)
+            for geometry, stitch in zip(geometry_ids, stitch_ids)
+        )
         panel_outputs: dict[str, dict[str, Path]] = {}
-        for panel_id in dataset.panels:
-            outputs = self._process_panel(dataset, panel_id)
+        for panel_id in dataset.panels if need_panels else []:
+            filters = self._panel_filters(dataset, panel_id)
+
+            def panel_work(panel_id: str = panel_id, filters: list[str] = filters) -> list[Path]:
+                stacked = self._process_panel(dataset, panel_id)
+                return [stacked[name] for name in filters]
+
+            paths = self._reuse_or_run(
+                f"panel:{dataset.dataset_id}:{panel_id}",
+                panel_work,
+                [
+                    self.run_dir / "inputs" / dataset.dataset_id / "panels" / panel_id,
+                    self.run_dir / "process" / dataset.dataset_id / "panels" / panel_id,
+                ],
+            )
+            outputs = dict(zip(filters, paths))
             self._verify_outputs(
                 outputs.values(), f"Integrating {dataset.dataset_id}/{panel_id}"
             )
@@ -6833,14 +7058,13 @@ class PipelineEngine:
                     ],
                     f"Released verified {dataset.dataset_id}/{panel_id} light workspace",
                 )
-        if dataset.panel_count > 1 and self.plan.options.mosaic_enabled:
+        if mosaic:
             return self._stitch_dataset_mosaics(dataset, panel_outputs)
-        outputs = [
+        return [
             output
             for panel_id in dataset.panels
             for output in panel_outputs[panel_id].values()
         ]
-        return self._solve_non_mosaic_outputs(dataset, outputs)
 
     def _finish_timing(self, status: str) -> float:
         assert self.started_monotonic is not None
@@ -6987,6 +7211,10 @@ class PipelineEngine:
                 "outputs": [],
                 "sessions": [],
             }
+        stats, _missing = collect_file_stats(self.plan)
+        self.stages = {spec.stage_id: spec for spec in stage_graph(self.plan, stats)}
+        self.adopt_legacy = previous is not None and "checkpoints" not in previous
+        self.manifest.setdefault("checkpoints", {})
         self.manifest["sessions"].append({
             "version": VERSION,
             "started_utc": self.started_utc,
@@ -7006,10 +7234,7 @@ class PipelineEngine:
                     "master_merge", self._process_master_merge()
                 ))
             for dataset in self.plan.datasets:
-                dataset_outputs = self._process_dataset(dataset)
-                outputs.extend(
-                    self._normalize_output_orientation(dataset.dataset_id, dataset_outputs)
-                )
+                outputs.extend(self._process_dataset_with_final(dataset))
             self._cmd("close")
             missing = [path for path in outputs if not path.is_file()]
             if missing:
