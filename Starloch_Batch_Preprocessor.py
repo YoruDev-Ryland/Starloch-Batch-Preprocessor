@@ -5293,9 +5293,11 @@ class PipelineEngine:
         log_callback: Callable[[str], None],
         progress_callback: Callable[[int], None],
         cancel_check: Callable[[], bool],
+        run_dir_callback: Optional[Callable[[Path], None]] = None,
     ):
         self.siril = siril
         self.plan = plan
+        self.run_dir_callback = run_dir_callback
         self._ui_log = log_callback
         self.log_callback = self._log
         self._run_log: Optional[TextIO] = None
@@ -7459,6 +7461,8 @@ class PipelineEngine:
             self._lock = RunLock(self.run_dir)
             self._lock.acquire()
         (self.run_dir / "masters").mkdir(exist_ok=True)
+        if self.run_dir_callback is not None:
+            self.run_dir_callback(self.run_dir)
         self._open_run_log()
         self.log_callback(f"Run folder: {self.run_dir}")
         if previous is not None:
@@ -7767,10 +7771,18 @@ class PipelineThread(QThread):
     failed = pyqtSignal(str, str)
     cancelled = pyqtSignal(str)
 
-    def __init__(self, siril: s.SirilInterface, plan: ProcessingPlan):
+    run_started = pyqtSignal(str)
+
+    def __init__(
+        self,
+        siril: s.SirilInterface,
+        plan: ProcessingPlan,
+        resume_dir: Optional[Path] = None,
+    ):
         super().__init__()
         self.siril = siril
         self.plan = plan
+        self.resume_dir = resume_dir
         self._cancel_requested = False
         self.engine: Optional[PipelineEngine] = None
 
@@ -7785,10 +7797,11 @@ class PipelineThread(QThread):
             self.log_line.emit,
             self.progress_value.emit,
             lambda: self._cancel_requested,
+            lambda path: self.run_started.emit(str(path)),
         )
         self.engine = engine
         try:
-            run_dir = engine.run()
+            run_dir = engine.run(resume_dir=self.resume_dir)
             self.succeeded.emit(str(run_dir))
         except PipelineCancelled as exc:
             partial = str(engine.run_dir or "")
@@ -7979,6 +7992,169 @@ class PanelMapWindow(QWidget):
         return self.canvas.panel_at(x, y)
 
 
+class RecentRunsWindow(QWidget):
+    """Non-modal list of recent runs: how each ended, its logs, and Resume."""
+
+    MERGE_TOOLTIP = (
+        "Master-merge runs can't be resumed yet; use Load settings to start a new run."
+    )
+    resume_requested = pyqtSignal(str)
+    load_settings_requested = pyqtSignal(str)
+
+    def __init__(self, index: RunIndex, active_run_dir: Callable[[], Optional[Path]]):
+        super().__init__(None, Qt.WindowType.Window)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setWindowTitle("Recent runs")
+        self.resize(920, 460)
+        self.index = index
+        self.active_run_dir = active_run_dir
+        self.busy = False
+        self._summaries: list[RunSummary] = []
+        layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Status", "Target", "Started", "Total time", "Got to"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        layout.addWidget(self.table, 1)
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        self.error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self.error_label)
+        buttons = QHBoxLayout()
+        self.resume_button = QPushButton("Resume")
+        self.open_folder_button = QPushButton("Open run folder")
+        self.open_log_button = QPushButton("Open sbpp.log")
+        self.load_settings_button = QPushButton("Load settings into main window")
+        self.browse_button = QPushButton("Browse for a run folder…")
+        self.remove_button = QPushButton("Remove from list")
+        self.resume_button.clicked.connect(lambda: self._emit(self.resume_requested))
+        self.load_settings_button.clicked.connect(
+            lambda: self._emit(self.load_settings_requested)
+        )
+        self.open_folder_button.clicked.connect(self._open_folder)
+        self.open_log_button.clicked.connect(self._open_log)
+        self.browse_button.clicked.connect(self._browse)
+        self.remove_button.clicked.connect(self._remove)
+        for button in (
+            self.resume_button, self.open_folder_button, self.open_log_button,
+            self.load_settings_button,
+        ):
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        buttons.addWidget(self.browse_button)
+        buttons.addWidget(self.remove_button)
+        layout.addLayout(buttons)
+        self._selection_changed()
+
+    def summary_at(self, row: int) -> RunSummary:
+        return self._summaries[row]
+
+    def selected_summary(self) -> Optional[RunSummary]:
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not rows:
+            return None
+        return self._summaries[rows[0].row()]
+
+    def refresh(self) -> None:
+        previous = self.selected_summary()
+        active = self.active_run_dir()
+        self._summaries = [summarize_run(path, active) for path in self.index.run_dirs()]
+        self.table.setRowCount(len(self._summaries))
+        muted = self.palette().color(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text)
+        for row, summary in enumerate(self._summaries):
+            values = [
+                summary.status,
+                f"{summary.target}\n{summary.detail}" if summary.detail else summary.target,
+                summary.started, summary.total_time, summary.progress,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setToolTip(str(summary.run_dir))
+                if not summary.exists:
+                    item.setForeground(muted)
+                self.table.setItem(row, column, item)
+        self.table.resizeRowsToContents()
+        self.table.resizeColumnsToContents()
+        if previous is not None:
+            for row, summary in enumerate(self._summaries):
+                if summary.run_dir == previous.run_dir:
+                    self.table.selectRow(row)
+        self._selection_changed()
+
+    def set_busy(self, busy: bool) -> None:
+        self.busy = busy
+        self._selection_changed()
+
+    def _selection_changed(self) -> None:
+        summary = self.selected_summary()
+        exists = bool(summary and summary.exists)
+        self.resume_button.setEnabled(bool(summary and summary.resumable and not self.busy))
+        self.resume_button.setToolTip(
+            self.MERGE_TOOLTIP if summary and summary.is_master_merge else ""
+        )
+        self.load_settings_button.setEnabled(exists and not self.busy)
+        self.open_folder_button.setEnabled(exists)
+        self.open_log_button.setEnabled(
+            exists and summary is not None and (summary.run_dir / "sbpp.log").is_file()
+        )
+        self.remove_button.setEnabled(summary is not None)
+        if summary is None:
+            self.error_label.setText("")
+        elif not summary.exists:
+            self.error_label.setText(f"This run folder no longer exists:\n{summary.run_dir}")
+        else:
+            lines = [str(summary.run_dir)]
+            if summary.error:
+                lines.append(f"Error: {summary.error}")
+            self.error_label.setText("\n".join(lines))
+
+    def _emit(self, signal: Any) -> None:
+        summary = self.selected_summary()
+        if summary is not None:
+            signal.emit(str(summary.run_dir))
+
+    def _open_path(self, path: Path) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.information(self, APP_NAME, str(path))
+
+    def _open_folder(self) -> None:
+        summary = self.selected_summary()
+        if summary is not None:
+            self._open_path(summary.run_dir)
+
+    def _open_log(self) -> None:
+        summary = self.selected_summary()
+        if summary is not None:
+            self._open_path(summary.run_dir / "sbpp.log")
+
+    def _browse(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Choose an SBPP run folder")
+        if not chosen:
+            return
+        if not (Path(chosen) / "manifest.json").is_file():
+            QMessageBox.warning(
+                self, APP_NAME,
+                "That folder has no manifest.json, so it is not an SBPP run folder.",
+            )
+            return
+        self.index.add(Path(chosen))
+        self.refresh()
+        self.table.selectRow(0)
+
+    def _remove(self) -> None:
+        summary = self.selected_summary()
+        if summary is not None:
+            self.index.remove(summary.run_dir)
+            self.refresh()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, siril: s.SirilInterface):
         super().__init__()
@@ -8001,6 +8177,10 @@ class MainWindow(QMainWindow):
         self.elapsed_timer.timeout.connect(self._update_elapsed_display)
         self.update_task: Optional[BackgroundTask] = None
         self.panel_map_window: Optional[PanelMapWindow] = None
+        self.run_index = RunIndex(self.store.config_dir)
+        self.recent_runs_window: Optional[RecentRunsWindow] = None
+        self.resume_run_dir: Optional[Path] = None
+        self.active_run_dir: Optional[Path] = None
 
         self.setWindowTitle(f"{APP_NAME} {VERSION}")
         self.resize(1320, 820)
@@ -8066,6 +8246,21 @@ class MainWindow(QMainWindow):
         profile_row.addWidget(self.delete_profile_button)
         layout.addLayout(profile_row)
 
+        self.resume_banner = QWidget()
+        banner = QHBoxLayout(self.resume_banner)
+        banner.setContentsMargins(8, 4, 8, 4)
+        self.resume_banner_label = QLabel()
+        self.resume_banner_label.setWordWrap(True)
+        self.cancel_resume_button = QPushButton("Cancel resume")
+        self.cancel_resume_button.clicked.connect(self.exit_resume_mode)
+        banner.addWidget(self.resume_banner_label, 1)
+        banner.addWidget(self.cancel_resume_button)
+        self.resume_banner.setStyleSheet(
+            "QWidget { background: rgba(91, 140, 255, 0.18); border-radius: 4px; }"
+        )
+        self.resume_banner.hide()
+        layout.addWidget(self.resume_banner)
+
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_setup_tab(), "1. Setup")
         self.tabs.addTab(self._build_plan_tab(), "2. Calibration plan")
@@ -8095,6 +8290,10 @@ class MainWindow(QMainWindow):
         self.panel_layout_button.setEnabled(False)
         self.panel_layout_button.clicked.connect(lambda: self._show_panel_map())
         controls.addWidget(self.panel_layout_button)
+        self.recent_runs_button = QPushButton("Recent runs…")
+        self.recent_runs_button.setToolTip("See past runs, open their logs, or resume one.")
+        self.recent_runs_button.clicked.connect(self._show_recent_runs)
+        controls.addWidget(self.recent_runs_button)
         controls.addWidget(self.save_plan_button)
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
@@ -8200,7 +8399,8 @@ class MainWindow(QMainWindow):
         self.target_edit.setPlaceholderText("Auto-detected from agreeing light OBJECT headers")
         self.target_edit.textEdited.connect(self._target_name_edited)
         form.addRow("Input root:", self._path_row(self.input_edit, self._browse_input))
-        form.addRow("Output root:", self._path_row(self.output_edit, self._browse_output))
+        self.output_row = self._path_row(self.output_edit, self._browse_output)
+        form.addRow("Output root:", self.output_row)
         form.addRow("Target name:", self.target_edit)
         layout.addWidget(paths)
 
@@ -8782,6 +8982,16 @@ class MainWindow(QMainWindow):
             return
         self._loading_profile = True
         profile = self.store.profile(name)
+        self._apply_profile_values(profile)
+        self.store.payload["selected_profile"] = name
+        self._active_profile_name = name
+        self.delete_profile_button.setEnabled(name != "Default")
+        self._loading_profile = False
+
+    def _apply_profile_values(self, profile: dict[str, Any]) -> None:
+        """Put a profile's (or a run's) settings into the widgets; clears the plan."""
+        loading = self._loading_profile
+        self._loading_profile = True
         self.calibration_list.clear()
         self.calibration_list.addItems(profile.get("calibration_roots", []))
         options = PlanOptions(**{
@@ -8794,16 +9004,13 @@ class MainWindow(QMainWindow):
         self.output_edit.setText(profile.get("output_root", ""))
         self._auto_inferred_target = ""
         self.target_edit.setText(profile.get("target_name", ""))
-        self.store.payload["selected_profile"] = name
-        self._active_profile_name = name
-        self.delete_profile_button.setEnabled(name != "Default")
         self.current_plan = None
         self._refresh_panel_map()
         self.drizzle_list.clear()
         self._update_drizzle_default_visibility()
         self.start_button.setEnabled(False)
         self.save_plan_button.setEnabled(False)
-        self._loading_profile = False
+        self._loading_profile = loading
 
     def _current_options(self) -> PlanOptions:
         return PlanOptions(
@@ -9406,6 +9613,11 @@ class MainWindow(QMainWindow):
         if self.current_plan is None or not self.current_plan.valid:
             QMessageBox.warning(self, APP_NAME, "Build a valid calibration plan first.")
             return
+        if self.resume_run_dir is not None:
+            if not self._confirm_resume():
+                return
+            self._launch_pipeline(self.resume_run_dir)
+            return
         merge = self.current_plan.master_merge
         if merge is not None:
             prompt = (
@@ -9436,6 +9648,10 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        self._launch_pipeline(None)
+
+    def _launch_pipeline(self, resume_dir: Optional[Path]) -> None:
+        assert self.current_plan is not None
         self._save_profile()
         self.tabs.setCurrentIndex(3)
         self.progress_bar.setValue(0)
@@ -9448,13 +9664,16 @@ class MainWindow(QMainWindow):
         self.elapsed_label.setText("Elapsed 00:00:00")
         self.elapsed_timer.start(1000)
         self._append_log("Processing timer started.")
-        self.pipeline_thread = PipelineThread(self.siril, self.current_plan)
+        self.pipeline_thread = PipelineThread(self.siril, self.current_plan, resume_dir)
+        self.pipeline_thread.run_started.connect(self._run_started)
         self.pipeline_thread.log_line.connect(self._append_log)
         self.pipeline_thread.progress_value.connect(self.progress_bar.setValue)
         self.pipeline_thread.succeeded.connect(self._processing_succeeded)
         self.pipeline_thread.failed.connect(self._processing_failed)
         self.pipeline_thread.cancelled.connect(self._processing_cancelled)
         self.pipeline_thread.start()
+        if self.recent_runs_window is not None:
+            self.recent_runs_window.set_busy(True)
 
     def _stop_processing(self) -> None:
         if self.pipeline_thread and self.pipeline_thread.isRunning():
@@ -9469,6 +9688,11 @@ class MainWindow(QMainWindow):
             )
         self.elapsed_timer.stop()
         self.run_started_monotonic = None
+        self.active_run_dir = None
+        if self.recent_runs_window is not None:
+            self.recent_runs_window.set_busy(False)
+            if self.recent_runs_window.isVisible():
+                self.recent_runs_window.refresh()
         engine = self.pipeline_thread.engine if self.pipeline_thread else None
         if engine is not None and engine.run_dir is not None:
             self.last_run_dir = engine.run_dir
@@ -9480,6 +9704,7 @@ class MainWindow(QMainWindow):
 
     def _processing_succeeded(self, run_dir: str) -> None:
         self._reset_after_processing()
+        self.exit_resume_mode()
         self.progress_bar.setValue(100)
         elapsed_text = human_duration(self.last_run_elapsed)
         try:
@@ -9690,6 +9915,117 @@ class MainWindow(QMainWindow):
 
         self._run_update_task(lambda: download_release(release), downloaded, failed, "Updating…")
 
+    # --- Recent runs and resume ----------------------------------------------
+
+    def _show_recent_runs(self) -> None:
+        if self.recent_runs_window is None:
+            self.recent_runs_window = RecentRunsWindow(
+                self.run_index, lambda: self.active_run_dir
+            )
+            self.recent_runs_window.resume_requested.connect(
+                lambda path: self.enter_resume_mode(Path(path))
+            )
+            self.recent_runs_window.load_settings_requested.connect(
+                lambda path: self.load_run_settings(Path(path))
+            )
+        self.recent_runs_window.set_busy(self._processing_active())
+        self.recent_runs_window.refresh()
+        self.recent_runs_window.show()
+        self.recent_runs_window.raise_()
+        self.recent_runs_window.activateWindow()
+
+    def _processing_active(self) -> bool:
+        return bool(self.pipeline_thread and self.pipeline_thread.isRunning())
+
+    def _load_plan_into_window(self, plan: ProcessingPlan) -> None:
+        self._apply_profile_values({
+            "calibration_roots": list(plan.calibration_roots),
+            "options": asdict(plan.options),
+            "input_root": plan.input_root,
+            "output_root": plan.output_root,
+            "target_name": plan.target_name,
+        })
+        self.current_plan = plan
+        self._populate_drizzle_channels(plan)
+        self._display_plan(plan)
+        self._refresh_panel_map()
+        self.save_plan_button.setEnabled(True)
+        self.start_button.setEnabled(plan.valid)
+        self.tabs.setCurrentIndex(1)
+
+    def _plan_from_run(self, run_dir: Path) -> Optional[ProcessingPlan]:
+        try:
+            manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
+            return ProcessingPlan.from_dict(manifest["plan"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            QMessageBox.warning(self, APP_NAME, f"Could not read that run's settings:\n{exc}")
+            return None
+
+    def load_run_settings(self, run_dir: Path) -> None:
+        """Load a run's settings to start a new run with them."""
+        if self._processing_active():
+            return
+        plan = self._plan_from_run(run_dir)
+        if plan is None:
+            return
+        self.exit_resume_mode()
+        self._load_plan_into_window(plan)
+        self._append_log(f"Loaded settings from {run_dir.name}.")
+
+    def enter_resume_mode(self, run_dir: Path) -> None:
+        if self._processing_active():
+            return
+        plan = self._plan_from_run(run_dir)
+        if plan is None:
+            return
+        self._load_plan_into_window(plan)
+        self.resume_run_dir = Path(run_dir)
+        self.output_edit.setText(str(Path(run_dir).parent))
+        self.output_row.setEnabled(False)
+        self.resume_banner_label.setText(
+            f"Resuming {Path(run_dir).name}. Start will continue in that folder. "
+            "You can change settings (rescan if you change folders or calibration options)."
+        )
+        self.resume_banner.show()
+        self._append_log(f"Resume mode: {run_dir}")
+
+    def exit_resume_mode(self) -> None:
+        self.resume_run_dir = None
+        self.output_row.setEnabled(True)
+        self.resume_banner.hide()
+
+    def _run_started(self, path: str) -> None:
+        self.active_run_dir = Path(path)
+        self.run_index.add(Path(path))
+        if self.recent_runs_window is not None and self.recent_runs_window.isVisible():
+            self.recent_runs_window.refresh()
+
+    def _confirm_resume(self) -> bool:
+        assert self.current_plan is not None and self.resume_run_dir is not None
+        preview = preview_resume(self.resume_run_dir, self.current_plan)
+        if preview.missing_inputs:
+            shown = preview.missing_inputs[:20]
+            more = len(preview.missing_inputs) - len(shown)
+            QMessageBox.warning(
+                self, APP_NAME,
+                f"Can't resume: {len(preview.missing_inputs)} input file(s) are missing.\n\n"
+                + "\n".join(shown)
+                + (f"\n… and {more} more" if more > 0 else "")
+                + "\n\nReconnect the drive that holds them, or rescan.",
+            )
+            return False
+
+        def bullets(items: list[str]) -> str:
+            return "\n".join(f"• {item}" for item in items) or "• nothing"
+
+        answer = QMessageBox.question(
+            self, "Resume run",
+            f"Reuse:\n{bullets(preview.reused)}\n\nRedo:\n{bullets(preview.redo)}\n\n"
+            f"Continue in {self.resume_run_dir.name}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
     def _update_panel_layout_button(self) -> None:
         plan = self.current_plan
         self.panel_layout_button.setEnabled(bool(
@@ -9729,6 +10065,8 @@ class MainWindow(QMainWindow):
         self._save_profile()
         if self.panel_map_window is not None:
             self.panel_map_window.close()
+        if self.recent_runs_window is not None:
+            self.recent_runs_window.close()
         event.accept()
 
 
