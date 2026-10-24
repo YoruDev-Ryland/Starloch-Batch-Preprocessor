@@ -401,20 +401,36 @@ def angular_separation_deg(
     return math.degrees(math.acos(max(-1.0, min(1.0, cosine))))
 
 
-def short_field_of_view_deg(meta: "FrameMeta") -> Optional[float]:
-    """Estimate the sensor's short angular dimension from acquisition headers."""
+def _axis_fields_of_view(meta: "FrameMeta") -> list[Optional[float]]:
+    """Angular size along image X and Y from acquisition headers (None if unknown)."""
     if not meta.focal_length_mm or meta.focal_length_mm <= 0:
-        return None
-    dimensions = []
+        return [None, None]
+    sizes: list[Optional[float]] = []
     for pixels, pixel_size in (
         (meta.width, meta.pixel_size_x_um),
         (meta.height, meta.pixel_size_y_um or meta.pixel_size_x_um),
     ):
         if pixels and pixel_size and pixels > 0 and pixel_size > 0:
             sensor_mm = pixels * pixel_size / 1000.0
-            dimensions.append(math.degrees(
+            sizes.append(math.degrees(
                 2.0 * math.atan(sensor_mm / (2.0 * meta.focal_length_mm))
             ))
+        else:
+            sizes.append(None)
+    return sizes
+
+
+def field_of_view_deg(meta: "FrameMeta") -> Optional[tuple[float, float]]:
+    """Angular (width along image X, height along image Y), or None if unknown."""
+    width, height = _axis_fields_of_view(meta)
+    if width is None or height is None:
+        return None
+    return width, height
+
+
+def short_field_of_view_deg(meta: "FrameMeta") -> Optional[float]:
+    """Estimate the sensor's short angular dimension from acquisition headers."""
+    dimensions = [size for size in _axis_fields_of_view(meta) if size is not None]
     return min(dimensions) if dimensions else None
 
 
@@ -574,6 +590,223 @@ def assign_panel_ids(
             "and solved WCS coordinates were unavailable; review every panel assignment."
         )
     return assignments, summary, warnings
+
+
+# --- Mosaic panel layout (drawn by PanelMapWindow) -----------------------------
+
+
+@dataclass
+class PanelOutline:
+    panel_id: str
+    number: Optional[int]
+    center_ra_deg: float
+    center_dec_deg: float
+    width_deg: float
+    height_deg: float
+    angle_deg: Optional[float]
+    corners: list[tuple[float, float]]
+    frame_points: list[tuple[float, float]]
+    filter_counts: dict[str, int]
+    missing_filters: list[str]
+    overlaps: dict[str, float] = field(default_factory=dict)
+    isolated: bool = False
+
+
+@dataclass
+class PanelLayout:
+    dataset_id: str
+    panels: list[PanelOutline]
+    drawable: bool
+    message: str
+    rotation_known: bool
+    unplaced: list[str]
+
+
+def _unit_vector(ra_deg: float, dec_deg: float) -> tuple[float, float, float]:
+    ra, dec = math.radians(ra_deg), math.radians(dec_deg)
+    return math.cos(dec) * math.cos(ra), math.cos(dec) * math.sin(ra), math.sin(dec)
+
+
+def _mean_direction(points: list[tuple[float, float]]) -> tuple[float, float]:
+    x = y = z = 0.0
+    for ra, dec in points:
+        ux, uy, uz = _unit_vector(ra, dec)
+        x, y, z = x + ux, y + uy, z + uz
+    return _cluster_center({"x": x, "y": y, "z": z})
+
+
+def _gnomonic(
+    ra_deg: float, dec_deg: float, centre: tuple[float, float]
+) -> tuple[float, float]:
+    """Tangent-plane (xi east, eta north) in degrees about ``centre``."""
+    a, d = math.radians(ra_deg), math.radians(dec_deg)
+    a0, d0 = math.radians(centre[0]), math.radians(centre[1])
+    cosc = math.sin(d0) * math.sin(d) + math.cos(d0) * math.cos(d) * math.cos(a - a0)
+    xi = math.cos(d) * math.sin(a - a0) / cosc
+    eta = (math.cos(d0) * math.sin(d) - math.sin(d0) * math.cos(d) * math.cos(a - a0)) / cosc
+    return math.degrees(xi), math.degrees(eta)
+
+
+def _polygon_area(polygon: list[tuple[float, float]]) -> float:
+    return 0.5 * sum(
+        x1 * y2 - x2 * y1
+        for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1])
+    )
+
+
+def _convex_intersection_area(
+    a: list[tuple[float, float]], b: list[tuple[float, float]]
+) -> float:
+    """Area shared by two convex polygons (Sutherland-Hodgman clipping)."""
+    subject = a if _polygon_area(a) >= 0 else a[::-1]
+    clip = b if _polygon_area(b) >= 0 else b[::-1]
+    output = list(subject)
+    for (cx1, cy1), (cx2, cy2) in zip(clip, clip[1:] + clip[:1]):
+        if not output:
+            break
+
+        def inside(point: tuple[float, float]) -> bool:
+            return (cx2 - cx1) * (point[1] - cy1) - (cy2 - cy1) * (point[0] - cx1) >= 0
+
+        def crossing(p: tuple[float, float], q: tuple[float, float]) -> tuple[float, float]:
+            dx, dy = q[0] - p[0], q[1] - p[1]
+            ex, ey = cx2 - cx1, cy2 - cy1
+            denominator = dx * ey - dy * ex
+            t = ((cx1 - p[0]) * ey - (cy1 - p[1]) * ex) / denominator
+            return p[0] + t * dx, p[1] + t * dy
+
+        points, output = output, []
+        for current, following in zip(points, points[1:] + points[:1]):
+            if inside(following):
+                if not inside(current):
+                    output.append(crossing(current, following))
+                output.append(following)
+            elif inside(current):
+                output.append(crossing(current, following))
+    return abs(_polygon_area(output)) if len(output) >= 3 else 0.0
+
+
+def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
+    """Sky layout of a dataset's panels from scan metadata, for drawing."""
+    filters = list(dataset.channels)
+    frames_by_panel: dict[str, list[tuple[str, FrameMeta]]] = {}
+    for filter_name, groups in dataset.channels.items():
+        for group in groups:
+            frames_by_panel.setdefault(group.panel_id, []).extend(
+                (filter_name, frame) for frame in group.frames
+            )
+    all_sizes = [
+        size for entries in frames_by_panel.values()
+        for _filter, frame in entries
+        if (size := field_of_view_deg(frame)) is not None
+    ]
+
+    placed: list[dict[str, Any]] = []
+    unplaced: list[str] = []
+    for panel_id in dataset.panels:
+        entries = frames_by_panel.get(panel_id, [])
+        located = [
+            frame for _filter, frame in entries
+            if frame.pointing_ra_deg is not None and frame.pointing_dec_deg is not None
+        ]
+        preferred = [
+            frame for frame in located if frame.pointing_source in {"target", "wcs"}
+        ] or located
+        if not preferred:
+            unplaced.append(panel_id)
+            continue
+        sizes = [size for _f, frame in entries if (size := field_of_view_deg(frame))]
+        angles = [
+            frame.position_angle_deg for _f, frame in entries
+            if frame.position_angle_deg is not None
+        ]
+        counts = Counter(filter_name for filter_name, _frame in entries)
+        placed.append({
+            "panel_id": panel_id,
+            "centre": _mean_direction([
+                (frame.pointing_ra_deg, frame.pointing_dec_deg) for frame in preferred
+            ]),
+            "frames": [(frame.pointing_ra_deg, frame.pointing_dec_deg) for frame in preferred],
+            "sizes": sizes,
+            "angle": (
+                math.degrees(math.atan2(
+                    sum(math.sin(math.radians(a)) for a in angles),
+                    sum(math.cos(math.radians(a)) for a in angles),
+                )) % 360.0
+                if angles else None
+            ),
+            "counts": {name: counts[name] for name in filters if counts[name]},
+            "missing": [name for name in filters if not counts[name]],
+        })
+
+    if not placed:
+        return PanelLayout(
+            dataset.dataset_id, [], False,
+            "These frames have no sky coordinates, so the panel layout cannot be drawn.",
+            False, unplaced,
+        )
+    if not all_sizes:
+        return PanelLayout(
+            dataset.dataset_id, [], False,
+            "Panel size unknown: frames have no focal length or pixel size.",
+            False, unplaced,
+        )
+
+    projection_centre = _mean_direction([entry["centre"] for entry in placed])
+    panels: list[PanelOutline] = []
+    for entry in placed:
+        sizes = entry["sizes"] or all_sizes
+        width = float(np.median([size[0] for size in sizes]))
+        height = float(np.median([size[1] for size in sizes]))
+        xi, eta = _gnomonic(*entry["centre"], projection_centre)
+        angle = math.radians(entry["angle"] or 0.0)
+        # Image +Y points ``angle`` east of north; image +X is perpendicular.
+        y_axis = (math.sin(angle), math.cos(angle))
+        x_axis = (-math.cos(angle), math.sin(angle))
+        corners = []
+        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            corner_xi = xi + sx * width / 2 * x_axis[0] + sy * height / 2 * y_axis[0]
+            corner_eta = eta + sx * width / 2 * x_axis[1] + sy * height / 2 * y_axis[1]
+            corners.append((-corner_xi, corner_eta))
+        points = []
+        for ra, dec in entry["frames"]:
+            frame_xi, frame_eta = _gnomonic(ra, dec, projection_centre)
+            points.append((-frame_xi, frame_eta))
+        digits = re.findall(r"\d+", entry["panel_id"])
+        panels.append(PanelOutline(
+            panel_id=entry["panel_id"],
+            number=int(digits[-1]) if digits else None,
+            center_ra_deg=entry["centre"][0],
+            center_dec_deg=entry["centre"][1],
+            width_deg=width,
+            height_deg=height,
+            angle_deg=entry["angle"],
+            corners=corners,
+            frame_points=points,
+            filter_counts=entry["counts"],
+            missing_filters=entry["missing"],
+        ))
+
+    for index, first in enumerate(panels):
+        for second in panels[index + 1:]:
+            shared = _convex_intersection_area(first.corners, second.corners)
+            smaller = min(
+                abs(_polygon_area(first.corners)), abs(_polygon_area(second.corners))
+            )
+            if smaller > 0 and shared / smaller > 1e-6:
+                fraction = shared / smaller
+                first.overlaps[second.panel_id] = fraction
+                second.overlaps[first.panel_id] = fraction
+    for panel in panels:
+        panel.isolated = len(panels) > 1 and not panel.overlaps
+    return PanelLayout(
+        dataset_id=dataset.dataset_id,
+        panels=panels,
+        drawable=True,
+        message="",
+        rotation_known=all(panel.angle_deg is not None for panel in panels),
+        unplaced=unplaced,
+    )
 
 
 def siril_theme_mode(siril: Any) -> str:
