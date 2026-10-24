@@ -100,7 +100,7 @@ UPDATE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SECONDS = 24 * 3600
 SCHEMA_VERSION = 1
 DEFAULTS_REVISION = 8
-METADATA_CACHE_VERSION = 3
+METADATA_CACHE_VERSION = 4
 CLEANUP_RETRY_DELAYS = (0.1, 0.2, 0.4, 0.8, 1.2, 1.6, 2.0)
 TINY_STACK_MEDIAN_MAX = 7
 MIN_LINEAR_STACK_COUNT = 40
@@ -217,6 +217,33 @@ def sexagesimal_degrees(value: Any, *, hours: bool = False) -> Optional[float]:
     if not math.isfinite(result):
         return None
     return result % 360.0 if hours else result
+
+
+def position_angle_from_header(header: dict[str, Any]) -> Optional[float]:
+    """Sky angle of the image +Y axis, degrees east of north, or None.
+
+    WCS rotation wins over NINA's planned framing angle (OBJCTROT). The
+    mechanical ROTATOR/ROTATANG angles are deliberately ignored: they are not
+    sky angles.
+    """
+    def value(key: str) -> Optional[float]:
+        return safe_float(first_header(header, key))
+
+    cd12, cd22 = value("CD1_2"), value("CD2_2")
+    if cd12 is not None and cd22 is not None and (cd12 or cd22):
+        return math.degrees(math.atan2(cd12, cd22)) % 360.0
+    pc12, pc22 = value("PC1_2"), value("PC2_2")
+    cdelt1, cdelt2 = value("CDELT1"), value("CDELT2")
+    if pc12 is not None and pc22 is not None and cdelt1 and cdelt2:
+        # CD = diag(CDELT1, CDELT2) @ PC
+        return math.degrees(math.atan2(cdelt1 * pc12, cdelt2 * pc22)) % 360.0
+    crota2 = value("CROTA2")
+    if crota2 is not None and cdelt2:
+        return (-crota2) % 360.0
+    planned = value("OBJCTROT")
+    if planned is not None:
+        return planned % 360.0
+    return None
 
 
 def pointing_from_header(
@@ -686,6 +713,7 @@ class FrameMeta:
     size: int = 0
     mtime_ns: int = 0
     warning: str = ""
+    position_angle_deg: Optional[float] = None
 
     @property
     def path_obj(self) -> Path:
@@ -798,6 +826,7 @@ def metadata_from_header(
         pointing_ra_deg=pointing_ra,
         pointing_dec_deg=pointing_dec,
         pointing_source=pointing_source,
+        position_angle_deg=position_angle_from_header(header),
         focal_length_mm=safe_float(first_header(
             header, "FOCALLEN", "FOCAL-LEN", "FOCLEN", "FOCAL"
         )),
