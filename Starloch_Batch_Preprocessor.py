@@ -46,6 +46,7 @@ from astropy.io import fits  # pylint: disable=wrong-import-position
 from astropy.wcs import WCS  # pylint: disable=wrong-import-position
 import numpy as np  # pylint: disable=wrong-import-position
 from PyQt6.QtCore import (  # pylint: disable=wrong-import-position
+    QPointF,
     QStandardPaths,
     QThread,
     QTimer,
@@ -55,8 +56,12 @@ from PyQt6.QtCore import (  # pylint: disable=wrong-import-position
 from PyQt6.QtGui import (  # pylint: disable=wrong-import-position
     QColor,
     QFont,
+    QBrush,
     QGuiApplication,
+    QPainter,
     QPalette,
+    QPen,
+    QPolygonF,
 )
 from PyQt6.QtWidgets import (  # pylint: disable=wrong-import-position
     QApplication,
@@ -85,6 +90,7 @@ from PyQt6.QtWidgets import (  # pylint: disable=wrong-import-position
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -6776,6 +6782,181 @@ class PipelineThread(QThread):
             self.failed.emit(str(exc), traceback.format_exc())
 
 
+def panel_tooltip_text(panel: PanelOutline) -> str:
+    lines = [f"{name}: {count} frames" for name, count in panel.filter_counts.items()]
+    lines.append(f"Centre RA {panel.center_ra_deg:.4f}°, Dec {panel.center_dec_deg:+.4f}°")
+    if panel.missing_filters:
+        lines.append("Missing: " + ", ".join(panel.missing_filters))
+    if panel.isolated:
+        lines.append("No overlap with any other panel")
+    return "\n".join(lines)
+
+
+class _PanelCanvas(QWidget):
+    WARNING_COLOR = QColor("#ff7a3c")
+
+    def __init__(self, owner: "PanelMapWindow"):
+        super().__init__(owner)
+        self.owner = owner
+        self.setMouseTracking(True)
+        self.setMinimumSize(320, 260)
+
+    def _transform(self) -> Optional[tuple[float, float, float]]:
+        layout = self.owner.current_layout()
+        if layout is None or not layout.drawable or not layout.panels:
+            return None
+        xs = [x for panel in layout.panels for x, _ in panel.corners]
+        ys = [y for panel in layout.panels for _, y in panel.corners]
+        span_x = max(max(xs) - min(xs), 1e-9)
+        span_y = max(max(ys) - min(ys), 1e-9)
+        margin = 0.05
+        scale = min(
+            self.width() * (1 - 2 * margin) / span_x,
+            self.height() * (1 - 2 * margin) / span_y,
+        )
+        offset_x = self.width() / 2 - scale * (min(xs) + max(xs)) / 2
+        # Widget y grows downwards; north (larger y) is drawn up.
+        offset_y = self.height() / 2 + scale * (min(ys) + max(ys)) / 2
+        return scale, offset_x, offset_y
+
+    def to_widget(self, x_deg: float, y_deg: float) -> tuple[float, float]:
+        transform = self._transform()
+        if transform is None:
+            return (0.0, 0.0)
+        scale, offset_x, offset_y = transform
+        return offset_x + scale * x_deg, offset_y - scale * y_deg
+
+    def _polygon(self, panel: PanelOutline) -> QPolygonF:
+        return QPolygonF([QPointF(*self.to_widget(x, y)) for x, y in panel.corners])
+
+    def panel_at(self, x: float, y: float) -> Optional[PanelOutline]:
+        layout = self.owner.current_layout()
+        if self._transform() is None or layout is None:
+            return None
+        point = QPointF(x, y)
+        for panel in reversed(layout.panels):
+            if self._polygon(panel).containsPoint(point, Qt.FillRule.OddEvenFill):
+                return panel
+        return None
+
+    def paintEvent(self, _event: Any) -> None:  # noqa: N802 - Qt API name
+        if self._transform() is None:
+            return
+        layout = self.owner.current_layout()
+        assert layout is not None
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        normal = self.palette().color(QPalette.ColorRole.Highlight)
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(9, font.pointSize() + 2))
+        painter.setFont(font)
+        for panel in layout.panels:
+            warning = panel.isolated or bool(panel.missing_filters)
+            color = self.WARNING_COLOR if warning else normal
+            fill = QColor(color)
+            fill.setAlpha(64)
+            pen = QPen(color, 2)
+            if warning:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.setBrush(QBrush(fill))
+            polygon = self._polygon(panel)
+            painter.drawPolygon(polygon)
+            label = str(panel.number) if panel.number is not None else panel.panel_id
+            painter.drawText(
+                polygon.boundingRect(), Qt.AlignmentFlag.AlignCenter, label
+            )
+            if self.owner.frames_check.isChecked():
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QBrush(color))
+                for x, y in panel.frame_points:
+                    painter.drawEllipse(QPointF(*self.to_widget(x, y)), 2.0, 2.0)
+        painter.end()
+
+    def mouseMoveEvent(self, event: Any) -> None:  # noqa: N802 - Qt API name
+        position = event.position()
+        panel = self.panel_at(position.x(), position.y())
+        if panel is None:
+            QToolTip.hideText()
+        else:
+            QToolTip.showText(event.globalPosition().toPoint(), panel_tooltip_text(panel), self)
+
+
+class PanelMapWindow(QWidget):
+    """Non-modal outline map of mosaic panels, refreshed in place on rescan."""
+
+    ROTATION_NOTE = "Camera rotation not in headers; panels drawn north-up."
+
+    def __init__(self) -> None:
+        super().__init__(None, Qt.WindowType.Window)
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.resize(640, 520)
+        self._plan: Optional[ProcessingPlan] = None
+        self._layouts: list[PanelLayout] = []
+        layout = QVBoxLayout(self)
+        self.dataset_combo = QComboBox()
+        self.dataset_combo.currentIndexChanged.connect(self._dataset_changed)
+        self.frames_check = QCheckBox("Show individual frames")
+        self.frames_check.toggled.connect(lambda _checked: self.canvas.update())
+        top = QHBoxLayout()
+        top.addWidget(self.dataset_combo)
+        top.addStretch(1)
+        top.addWidget(self.frames_check)
+        layout.addLayout(top)
+        self.canvas = _PanelCanvas(self)
+        layout.addWidget(self.canvas, 1)
+        self.note_label = QLabel()
+        self.note_label.setWordWrap(True)
+        layout.addWidget(self.note_label)
+
+    def set_plan(self, plan: Optional[ProcessingPlan]) -> None:
+        self._plan = plan
+        datasets = [
+            dataset for dataset in (plan.datasets if plan else [])
+            if dataset.panel_count > 1
+        ]
+        self._layouts = [panel_layout(dataset) for dataset in datasets]
+        self.dataset_combo.blockSignals(True)
+        self.dataset_combo.clear()
+        self.dataset_combo.addItems([dataset.dataset_id for dataset in datasets])
+        self.dataset_combo.blockSignals(False)
+        self.dataset_combo.setVisible(len(datasets) > 1)
+        self._dataset_changed()
+
+    def current_layout(self) -> Optional[PanelLayout]:
+        index = self.dataset_combo.currentIndex()
+        if 0 <= index < len(self._layouts):
+            return self._layouts[index]
+        return None
+
+    def _dataset_changed(self, *_args: Any) -> None:
+        layout = self.current_layout()
+        name = (self._plan.target_name if self._plan else "") or (
+            layout.dataset_id if layout else ""
+        )
+        self.setWindowTitle(f"Panel layout: {name}")
+        notes = []
+        if layout is not None:
+            if not layout.drawable:
+                notes.append(layout.message)
+                if layout.unplaced:
+                    notes.append("Panels found: " + ", ".join(layout.unplaced))
+            else:
+                if not layout.rotation_known:
+                    notes.append(self.ROTATION_NOTE)
+                if layout.unplaced:
+                    notes.append("Not drawn (no coordinates): " + ", ".join(layout.unplaced))
+        self.note_label.setText("\n".join(notes))
+        self.canvas.update()
+
+    def to_widget(self, x_deg: float, y_deg: float) -> tuple[float, float]:
+        return self.canvas.to_widget(x_deg, y_deg)
+
+    def panel_at(self, x: float, y: float) -> Optional[PanelOutline]:
+        return self.canvas.panel_at(x, y)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, siril: s.SirilInterface):
         super().__init__()
@@ -6797,6 +6978,7 @@ class MainWindow(QMainWindow):
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.timeout.connect(self._update_elapsed_display)
         self.update_task: Optional[BackgroundTask] = None
+        self.panel_map_window: Optional[PanelMapWindow] = None
 
         self.setWindowTitle(f"{APP_NAME} {VERSION}")
         self.resize(1320, 820)
@@ -6886,6 +7068,11 @@ class MainWindow(QMainWindow):
         self.elapsed_label = QLabel("Elapsed 00:00:00")
         self.elapsed_label.setMinimumWidth(130)
         controls.addWidget(self.scan_button)
+        self.panel_layout_button = QPushButton("Panel layout…")
+        self.panel_layout_button.setToolTip("Show how the mosaic panels line up on the sky.")
+        self.panel_layout_button.setEnabled(False)
+        self.panel_layout_button.clicked.connect(self._show_panel_map)
+        controls.addWidget(self.panel_layout_button)
         controls.addWidget(self.save_plan_button)
         controls.addWidget(self.start_button)
         controls.addWidget(self.stop_button)
@@ -7483,6 +7670,7 @@ class MainWindow(QMainWindow):
         if self._loading_profile or self.current_plan is None:
             return
         self.current_plan = None
+        self._refresh_panel_map()
         self.plan_table.setRowCount(0)
         self.plan_warnings.clear()
         self.drizzle_list.clear()
@@ -7588,6 +7776,7 @@ class MainWindow(QMainWindow):
         self._active_profile_name = name
         self.delete_profile_button.setEnabled(name != "Default")
         self.current_plan = None
+        self._refresh_panel_map()
         self.drizzle_list.clear()
         self._update_drizzle_default_visibility()
         self.start_button.setEnabled(False)
@@ -7997,6 +8186,7 @@ class MainWindow(QMainWindow):
             refresh_plan_storage(self.current_plan)
             self._populate_drizzle_channels(self.current_plan)
             self._display_plan(self.current_plan)
+            self._refresh_panel_map()
             self._save_profile()
             self.save_plan_button.setEnabled(True)
             self.start_button.setEnabled(self.current_plan.valid)
@@ -8021,6 +8211,7 @@ class MainWindow(QMainWindow):
                     )
         except Exception as exc:
             self.current_plan = None
+            self._refresh_panel_map()
             QMessageBox.critical(self, APP_NAME, f"Scan failed:\n{exc}")
             self._append_log(traceback.format_exc())
         finally:
@@ -8475,6 +8666,25 @@ class MainWindow(QMainWindow):
 
         self._run_update_task(lambda: download_release(release), downloaded, failed, "Updating…")
 
+    def _update_panel_layout_button(self) -> None:
+        plan = self.current_plan
+        self.panel_layout_button.setEnabled(bool(
+            plan and any(dataset.panel_count > 1 for dataset in plan.datasets)
+        ))
+
+    def _show_panel_map(self) -> None:
+        if self.panel_map_window is None:
+            self.panel_map_window = PanelMapWindow()
+        self.panel_map_window.set_plan(self.current_plan)
+        self.panel_map_window.show()
+        self.panel_map_window.raise_()
+        self.panel_map_window.activateWindow()
+
+    def _refresh_panel_map(self) -> None:
+        self._update_panel_layout_button()
+        if self.panel_map_window is not None and self.panel_map_window.isVisible():
+            self.panel_map_window.set_plan(self.current_plan)
+
     def closeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API name
         if self.update_task is not None:
             # Destroying a running QThread aborts the process; a check or
@@ -8488,6 +8698,8 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._save_profile()
+        if self.panel_map_window is not None:
+            self.panel_map_window.close()
         event.accept()
 
 
