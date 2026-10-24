@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import faulthandler
+import hashlib
 import json
 import math
 import os
@@ -4636,6 +4637,310 @@ def graxpert_background_command(
     return command
 
 
+# --- Resumable stages ------------------------------------------------------------
+#
+# A run is a chain of stages. Each stage's fingerprint hashes everything that
+# can change its result (input files with size+mtime, the options it uses, its
+# code revision) plus the fingerprints of the stages it consumes, so redoing a
+# stage forces everything downstream to redo too. Bump a STAGE_REVISIONS entry
+# whenever a change alters what that stage produces.
+
+STAGE_REVISIONS: dict[str, int] = {
+    "calibration": 1, "panel": 1, "stitch": 1, "geometry": 1, "final": 1,
+}
+
+STAGE_OPTION_FIELDS: dict[str, tuple[str, ...]] = {
+    "calibration": (),
+    "panel": (
+        "debayer_cfa", "min_pairs_registration", "max_stars_registration",
+        "drizzle_scale", "drizzle_pixfrac", "drizzle_kernel", "fwhm_max",
+        "roundness_min", "stars_min", "small_stack_threshold",
+        "large_stack_threshold", "create_rejection_maps",
+    ),
+    "stitch": (
+        "mosaic_gradient_correction", "graxpert_executable", "graxpert_smoothing",
+        "graxpert_gpu", "mosaic_downsample_solve", "mosaic_blind_fallback",
+        "mosaic_background_matching", "mosaic_overlap_normalization", "mosaic_feather",
+    ),
+    "geometry": ("mosaic_feather",),
+    "final": ("solve_final_images", "mosaic_downsample_solve", "mosaic_blind_fallback"),
+}
+
+# Options that only shape the plan itself (so they reach stages through the
+# frames and calibration choices) or never change any output.
+NON_STAGE_OPTION_FIELDS: frozenset[str] = frozenset({
+    "recursive", "mosaic_enabled", "mosaic_cluster_percent", "prefer_masters",
+    "minimum_calibration_frames", "dark_policy", "exposure_tolerance",
+    "temperature_tolerance", "keep_intermediates", "rolling_cleanup",
+    "merge_blend_large_scales", "merge_transition_pixels", "merge_detail_sigma",
+    "merge_output_grid",
+})
+
+FileStats = dict[str, tuple[int, int]]
+
+MASTER_MODES = {"master", "bpm_master", "optimized_master"}
+BUILD_MODES = {"build", "bpm_build", "optimized_build"}
+
+
+@dataclass
+class StageSpec:
+    stage_id: str
+    kind: str
+    fingerprint: str
+    outputs: list[Path]  # relative to the run folder
+    label: str
+    upstream: list[str] = field(default_factory=list)
+
+
+def mosaic_output_name(plan: "ProcessingPlan", dataset: DatasetPlan, filter_name: str) -> str:
+    name = final_filter_stem(filter_name)
+    if len(plan.datasets) > 1:
+        name += f"_{slugify(dataset.dataset_id).lower()}"
+    return name
+
+
+def _plan_input_paths(plan: "ProcessingPlan") -> list[str]:
+    paths: dict[str, None] = {}
+    for dataset in plan.datasets:
+        for groups in dataset.channels.values():
+            for group in groups:
+                for frame in group.frames:
+                    paths[frame.path] = None
+                for choice in (group.bias, group.dark, group.flat, group.darkflat, group.bpm):
+                    for path in choice.files:
+                        paths[path] = None
+    return list(paths)
+
+
+def collect_file_stats(plan: "ProcessingPlan") -> tuple[FileStats, list[str]]:
+    """Fresh (size, mtime_ns) for every light and calibration file the plan uses."""
+    stats: FileStats = {}
+    missing: list[str] = []
+    for path in _plan_input_paths(plan):
+        try:
+            info = os.stat(path)
+        except OSError:
+            missing.append(path)
+            continue
+        stats[path] = (info.st_size, info.st_mtime_ns)
+    return stats, missing
+
+
+def _stage_fingerprint(
+    kind: str, options: PlanOptions, inputs: Any, upstream: Iterable["StageSpec"]
+) -> str:
+    body = {
+        "kind": kind,
+        "revision": STAGE_REVISIONS[kind],
+        "options": {name: getattr(options, name) for name in STAGE_OPTION_FIELDS[kind]},
+        "inputs": inputs,
+        "upstream": sorted(spec.fingerprint for spec in upstream),
+    }
+    text = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def stage_graph(plan: "ProcessingPlan", stats: FileStats) -> list[StageSpec]:
+    """Every resumable stage of ``plan`` in the order the engine runs them.
+
+    Calibration naming mirrors the engine: the first subgroup that needs an
+    asset names its output file.
+    """
+    if plan.master_merge is not None:
+        return []
+    options = plan.options
+    specs: list[StageSpec] = []
+    assets: dict[Any, Optional[StageSpec]] = {}
+
+    def files(paths: Iterable[str]) -> list[list[Any]]:
+        return [[path, *stats.get(path, (None, None))] for path in paths]
+
+    def choice_inputs(choice: CalibrationChoice) -> dict[str, Any]:
+        return {"kind": choice.kind, "mode": choice.mode, "files": files(choice.files)}
+
+    def asset_id(choice: CalibrationChoice, *extra: Any) -> str:
+        digest = hashlib.sha1(
+            json.dumps([*choice.key, *extra], default=str).encode("utf-8")
+        ).hexdigest()[:12]
+        return f"calibration:{choice.kind}:{digest}"
+
+    def calibration_stage(
+        choice: CalibrationChoice, output: Path, text: str,
+        upstream: list[StageSpec], extra_inputs: Optional[dict[str, Any]] = None,
+        key_extra: tuple[Any, ...] = (),
+    ) -> StageSpec:
+        inputs = {"choice": choice_inputs(choice), **(extra_inputs or {})}
+        spec = StageSpec(
+            asset_id(choice, *key_extra), "calibration",
+            _stage_fingerprint("calibration", options, inputs, upstream),
+            [output], text, [item.stage_id for item in upstream],
+        )
+        specs.append(spec)
+        return spec
+
+    def materialize(choice: CalibrationChoice, label: str) -> Optional[StageSpec]:
+        if file_suffix(Path(choice.files[0])) in FITS_SUFFIXES:
+            return None  # used in place; its file stats reach consumers directly
+        return calibration_stage(
+            choice, Path("masters") / f"imported_{slugify(label)}.fit",
+            f"imported {choice.kind.lower()} master", [],
+        )
+
+    def simple(choice: CalibrationChoice, label: str) -> Optional[StageSpec]:
+        if not choice.available:
+            return None
+        if choice.key in assets:
+            return assets[choice.key]
+        spec = None
+        if choice.mode in MASTER_MODES:
+            spec = materialize(choice, label)
+        elif choice.mode in BUILD_MODES and choice.kind != FRAME_FLAT:
+            spec = calibration_stage(
+                choice, Path("masters") / f"master_{slugify(label)}.fit",
+                f"{choice.kind.lower()} master", [],
+            )
+        assets[choice.key] = spec
+        return spec
+
+    def flat(
+        group: LightSubgroup, bias: Optional[StageSpec],
+        darkflat: Optional[StageSpec], label: str,
+    ) -> Optional[StageSpec]:
+        choice = group.flat
+        if not choice.available:
+            return None
+        if choice.key in assets:
+            return assets[choice.key]
+        if choice.mode == "master":
+            spec = materialize(choice, label)
+        else:
+            spec = calibration_stage(
+                choice, Path("masters") / f"master_{slugify(label)}.fit",
+                f"flat master ({group.filter_name})",
+                [item for item in (bias, darkflat) if item],
+                {"bias": choice_inputs(group.bias), "darkflat": choice_inputs(group.darkflat)},
+            )
+        assets[choice.key] = spec
+        return spec
+
+    def bpm(group: LightSubgroup, label: str) -> Optional[StageSpec]:
+        choice = group.bpm
+        if not choice.available:
+            return None
+        sigma = light_cosmetic_hot_sigma(len(group.frames))
+        key = (*choice.key, sigma)
+        if key in assets:
+            return assets[key]
+        dark = simple(choice, f"{label}_dark_for_bpm")
+        spec = calibration_stage(
+            choice, Path("masters") / "bpm" / f"bad_pixels_{slugify(label)}.lst",
+            "bad-pixel map", [dark] if dark else [], {"hot_sigma": sigma},
+            key_extra=("bpm", sigma),
+        )
+        assets[key] = spec
+        return spec
+
+    for dataset in plan.datasets:
+        panel_specs: list[StageSpec] = []
+        for panel_id in dataset.panels:
+            upstream: list[StageSpec] = []
+            subgroups: list[dict[str, Any]] = []
+            panel_filters: list[str] = []
+            for filter_name, groups in dataset.channels.items():
+                members = [group for group in groups if group.panel_id == panel_id]
+                if members:
+                    panel_filters.append(filter_name)
+                for group in members:
+                    label = f"{dataset.dataset_id}_{group.subgroup_id}"
+                    bias = simple(group.bias, f"{label}_bias")
+                    dark = simple(group.dark, f"{label}_dark")
+                    darkflat = simple(group.darkflat, f"{label}_darkflat")
+                    flat_spec = flat(group, bias, darkflat, f"{label}_flat")
+                    bpm_spec = bpm(group, f"{label}_bpm")
+                    upstream.extend(
+                        spec for spec in (bias, dark, darkflat, flat_spec, bpm_spec)
+                        if spec and spec not in upstream
+                    )
+                    subgroups.append({
+                        "subgroup": group.subgroup_id,
+                        "filter": filter_name,
+                        "frames": files(frame.path for frame in group.frames),
+                        "calibration": {
+                            name: choice_inputs(getattr(group, name))
+                            for name in ("bias", "dark", "flat", "darkflat", "bpm")
+                        },
+                    })
+            outputs = []
+            for filter_name in panel_filters:
+                name = final_filter_stem(filter_name)
+                if dataset.panel_count > 1:
+                    outputs.append(
+                        Path("masters") / "panels" / dataset.dataset_id / panel_id / f"{name}.fit"
+                    )
+                else:
+                    if len(plan.datasets) > 1:
+                        name += f"_{slugify(dataset.dataset_id).lower()}"
+                    outputs.append(Path("masters") / f"{name}.fit")
+            inputs = {
+                "subgroups": subgroups,
+                "drizzle": sorted(
+                    name for name in panel_filters if plan.channel_uses_drizzle(dataset, name)
+                ),
+                "panel_count": dataset.panel_count,
+            }
+            spec = StageSpec(
+                f"panel:{dataset.dataset_id}:{panel_id}", "panel",
+                _stage_fingerprint("panel", options, inputs, upstream), outputs,
+                f"{panel_id} stacks ({', '.join(panel_filters)})",
+                [item.stage_id for item in upstream],
+            )
+            specs.append(spec)
+            panel_specs.append(spec)
+
+        final_upstream: list[StageSpec]
+        if dataset.panel_count > 1 and options.mosaic_enabled:
+            final_upstream = []
+            for drizzle in (False, True):
+                filters = [
+                    name for name in dataset.channels
+                    if plan.channel_uses_drizzle(dataset, name) == drizzle
+                ]
+                if not filters:
+                    continue
+                mode = "drizzle" if drizzle else "native"
+                names = [mosaic_output_name(plan, dataset, name) for name in filters]
+                stitch = StageSpec(
+                    f"stitch:{dataset.dataset_id}:{mode}", "stitch",
+                    _stage_fingerprint("stitch", options, {"filters": filters}, panel_specs),
+                    [
+                        Path("process") / dataset.dataset_id / f"mosaic_{mode}" / "stitched"
+                        / f"{name}.fit" for name in names
+                    ],
+                    f"{dataset.dataset_id} {mode} mosaic stitch",
+                    [item.stage_id for item in panel_specs],
+                )
+                geometry = StageSpec(
+                    f"geometry:{dataset.dataset_id}:{mode}", "geometry",
+                    _stage_fingerprint("geometry", options, {"filters": filters}, [stitch]),
+                    [Path("masters") / f"{name}.fit" for name in names],
+                    f"{dataset.dataset_id} {mode} mosaic crop",
+                    [stitch.stage_id],
+                )
+                specs.extend([stitch, geometry])
+                final_upstream.append(geometry)
+        else:
+            final_upstream = panel_specs
+        final_outputs = [output for spec in final_upstream for output in spec.outputs]
+        specs.append(StageSpec(
+            f"final:{dataset.dataset_id}", "final",
+            _stage_fingerprint("final", options, {}, final_upstream),
+            final_outputs,
+            f"{dataset.dataset_id} orientation and plate solving",
+            [item.stage_id for item in final_upstream],
+        ))
+    return specs
+
+
 class PipelineEngine:
     """Translate a reviewed ProcessingPlan into Siril commands."""
 
@@ -5567,10 +5872,7 @@ class PipelineEngine:
         self, dataset: DatasetPlan, filter_name: str, drizzle: bool
     ) -> str:
         del drizzle  # one final product exists per filter, regardless of its scale
-        name = final_filter_stem(filter_name)
-        if len(self.plan.datasets) > 1:
-            name += f"_{slugify(dataset.dataset_id).lower()}"
-        return name
+        return mosaic_output_name(self.plan, dataset, filter_name)
 
     def _finalize_mosaic_geometry(
         self,
