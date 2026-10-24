@@ -626,6 +626,7 @@ class PanelLayout:
     message: str
     rotation_known: bool
     unplaced: list[str]
+    far: list[str] = field(default_factory=list)
 
 
 def _unit_vector(ra_deg: float, dec_deg: float) -> tuple[float, float, float]:
@@ -639,6 +640,15 @@ def _mean_direction(points: list[tuple[float, float]]) -> tuple[float, float]:
         ux, uy, uz = _unit_vector(ra, dec)
         x, y, z = x + ux, y + uy, z + uz
     return _cluster_center({"x": x, "y": y, "z": z})
+
+
+FAR_PANEL_DEG = 30.0
+
+
+def _separation_deg(a: tuple[float, float], b: tuple[float, float]) -> float:
+    ua, ub = _unit_vector(*a), _unit_vector(*b)
+    dot = max(-1.0, min(1.0, sum(x * y for x, y in zip(ua, ub))))
+    return math.degrees(math.acos(dot))
 
 
 def _gnomonic(
@@ -734,11 +744,14 @@ def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
             ]),
             "frames": [(frame.pointing_ra_deg, frame.pointing_dec_deg) for frame in preferred],
             "sizes": sizes,
+            # Axial mean: an outline is the same rotated by 180 degrees, and
+            # plate-solved frames from both sides of a meridian flip differ
+            # by ~180 degrees, so a plain circular mean would cancel out.
             "angle": (
-                math.degrees(math.atan2(
-                    sum(math.sin(math.radians(a)) for a in angles),
-                    sum(math.cos(math.radians(a)) for a in angles),
-                )) % 360.0
+                0.5 * math.degrees(math.atan2(
+                    sum(math.sin(math.radians(2 * a)) for a in angles),
+                    sum(math.cos(math.radians(2 * a)) for a in angles),
+                )) % 180.0
                 if angles else None
             ),
             "counts": {name: counts[name] for name in filters if counts[name]},
@@ -758,6 +771,18 @@ def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
             False, unplaced,
         )
 
+    # Anchor on the panel closest to all others, so one wild coordinate (a
+    # park position, another target) is reported instead of being projected
+    # far outside the tangent plane's useful range.
+    anchor = min(
+        (entry["centre"] for entry in placed),
+        key=lambda centre: sum(_separation_deg(centre, other["centre"]) for other in placed),
+    )
+    far = [
+        entry["panel_id"] for entry in placed
+        if _separation_deg(entry["centre"], anchor) > FAR_PANEL_DEG
+    ]
+    placed = [entry for entry in placed if entry["panel_id"] not in far]
     projection_centre = _mean_direction([entry["centre"] for entry in placed])
     panels: list[PanelOutline] = []
     for entry in placed:
@@ -776,6 +801,8 @@ def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
             corners.append((-corner_xi, corner_eta))
         points = []
         for ra, dec in entry["frames"]:
+            if _separation_deg((ra, dec), projection_centre) > FAR_PANEL_DEG:
+                continue
             frame_xi, frame_eta = _gnomonic(ra, dec, projection_centre)
             points.append((-frame_xi, frame_eta))
         digits = re.findall(r"\d+", entry["panel_id"])
@@ -812,6 +839,7 @@ def panel_layout(dataset: "DatasetPlan") -> PanelLayout:
         message="",
         rotation_known=all(panel.angle_deg is not None for panel in panels),
         unplaced=unplaced,
+        far=far,
     )
 
 
@@ -6785,6 +6813,8 @@ class PipelineThread(QThread):
 def panel_tooltip_text(panel: PanelOutline) -> str:
     lines = [f"{name}: {count} frames" for name, count in panel.filter_counts.items()]
     lines.append(f"Centre RA {panel.center_ra_deg:.4f}°, Dec {panel.center_dec_deg:+.4f}°")
+    for other, fraction in sorted(panel.overlaps.items(), key=lambda item: natural_key(item[0])):
+        lines.append(f"Overlap with {other}: {fraction:.0%}")
     if panel.missing_filters:
         lines.append("Missing: " + ", ".join(panel.missing_filters))
     if panel.isolated:
@@ -6916,7 +6946,16 @@ class PanelMapWindow(QWidget):
             dataset for dataset in (plan.datasets if plan else [])
             if dataset.panel_count > 1
         ]
-        self._layouts = [panel_layout(dataset) for dataset in datasets]
+        self._layouts = []
+        for dataset in datasets:
+            # A display-only feature must never break scanning.
+            try:
+                self._layouts.append(panel_layout(dataset))
+            except Exception as exc:
+                self._layouts.append(PanelLayout(
+                    dataset.dataset_id, [], False,
+                    f"Layout could not be computed: {exc}", False, dataset.panels,
+                ))
         self.dataset_combo.blockSignals(True)
         self.dataset_combo.clear()
         self.dataset_combo.addItems([dataset.dataset_id for dataset in datasets])
@@ -6947,6 +6986,10 @@ class PanelMapWindow(QWidget):
                     notes.append(self.ROTATION_NOTE)
                 if layout.unplaced:
                     notes.append("Not drawn (no coordinates): " + ", ".join(layout.unplaced))
+                if layout.far:
+                    notes.append(
+                        "Too far from the rest of the mosaic to draw: " + ", ".join(layout.far)
+                    )
         self.note_label.setText("\n".join(notes))
         self.canvas.update()
 
