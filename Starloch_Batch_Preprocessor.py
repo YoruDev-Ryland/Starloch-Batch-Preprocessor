@@ -2418,21 +2418,20 @@ def build_master_merge_plan(masters: list[FrameMeta]) -> MasterMergePlan:
         warnings.append(
             "BLOCKING: master merge needs either all monochrome or all colour masters."
         )
-    seen: dict[tuple[int, str], str] = {}
+    tiles = Counter((entry.layer, normalized_text(entry.filter_name)) for entry in entries)
+    noted: set[tuple[int, str]] = set()
     for entry in entries:
         key = (entry.layer, normalized_text(entry.filter_name))
-        if key in seen:
+        if tiles[key] > 1 and key not in noted:
+            noted.add(key)
             warnings.append(
-                f"BLOCKING: layer {entry.layer} has two {entry.filter_name} masters at the "
-                f"same plate scale ({Path(seen[key]).name} and {Path(entry.path).name}). "
-                "Merging same-scale masters (a mosaic of masters) is not supported yet; "
-                "keep one per filter and scale."
+                f"Layer {entry.layer} combines {tiles[key]} {entry.filter_name} masters as a "
+                "mosaic: overlaps are brightness-matched, noise-weighted and feathered."
             )
-        else:
-            seen[key] = entry.path
+    same_scale_mosaic = any(count > 1 for count in tiles.values())
     if any(not meta.width or not meta.height for meta in masters):
         warnings.append("BLOCKING: one or more masters have unreadable image dimensions.")
-    if layer_count < 2:
+    if layer_count < 2 and not same_scale_mosaic:
         warnings.append(
             "BLOCKING: every master has the same plate scale, so there is nothing to "
             "merge. Master merge combines data from telescopes with different focal "
@@ -2504,6 +2503,10 @@ def build_master_merge_plan(masters: list[FrameMeta]) -> MasterMergePlan:
             int(round(float(widest.width) * ratio)),  # type: ignore[arg-type]
             int(round(float(widest.height) * ratio)),  # type: ignore[arg-type]
         )
+    if same_scale_mosaic and finest_scale:
+        estimated_canvas = _union_canvas_estimate(
+            masters, entries, finest_scale, estimated_canvas, max(tiles.values())
+        )
     return MasterMergePlan(
         masters=entries,
         layer_scales=layer_scales,
@@ -2511,6 +2514,48 @@ def build_master_merge_plan(masters: list[FrameMeta]) -> MasterMergePlan:
         estimated_canvas=estimated_canvas,
         warnings=warnings,
     )
+
+
+def _union_canvas_estimate(
+    masters: list[FrameMeta],
+    entries: list[MergeMaster],
+    finest_scale: float,
+    fallback: tuple[int, int],
+    largest_group: int,
+) -> tuple[int, int]:
+    """Canvas (finest-scale pixels) covering every master of a mosaic merge.
+
+    Uses each master's pointing and diagonal, so rotated tiles are covered too.
+    Without pointings it scales the single-master estimate by the tile count.
+    """
+    pointing = {meta.path: meta for meta in masters}
+    circles = []
+    for entry in entries:
+        meta = pointing.get(entry.path)
+        if (
+            meta is None or meta.pointing_ra_deg is None or meta.pointing_dec_deg is None
+            or not entry.scale_arcsec or not entry.width or not entry.height
+        ):
+            return (fallback[0] * largest_group, fallback[1] * largest_group)
+        radius = math.hypot(entry.width, entry.height) / 2.0 * entry.scale_arcsec / 3600.0
+        circles.append((meta.pointing_ra_deg, meta.pointing_dec_deg, radius))
+    centre = _mean_direction([(ra, dec) for ra, dec, _radius in circles])
+    xs, ys = [], []
+    for ra, dec, radius in circles:
+        xi, eta = _gnomonic(ra, dec, centre)
+        xs += [xi - radius, xi + radius]
+        ys += [eta - radius, eta + radius]
+    to_pixels = 3600.0 / finest_scale
+    return (
+        max(fallback[0], int(round((max(xs) - min(xs)) * to_pixels))),
+        max(fallback[1], int(round((max(ys) - min(ys)) * to_pixels))),
+    )
+
+
+def merge_has_same_scale_mosaic(merge: MasterMergePlan) -> bool:
+    """Whether some layer holds several masters of one filter (a mosaic of masters)."""
+    counts = Counter((entry.layer, normalized_text(entry.filter_name)) for entry in merge.masters)
+    return any(count > 1 for count in counts.values())
 
 
 def estimate_master_merge_storage(merge: MasterMergePlan) -> tuple[int, int]:
@@ -3919,6 +3964,112 @@ def _load_on_canvas(
     return canvas, header
 
 
+def combine_same_scale_tiles(
+    tiles: list[np.ndarray],
+    valids: list[np.ndarray],
+    noises: list[Optional[float]],
+    transition: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Mosaic same-scale masters of one filter that share a canvas.
+
+    The tile covering the most sky sets the brightness scale. Every other tile
+    (largest overlap first) is gain/offset-matched to what has been combined
+    so far, because masters from different sessions or filters differ in
+    throughput and sky background. All tiles are then averaged with
+    inverse-variance weights, feathered toward each tile's edge so no seam
+    appears where coverage changes.
+    """
+    count = len(tiles)
+    areas = [int(valid.sum()) for valid in valids]
+    reference = max(range(count), key=lambda index: (areas[index], -index))
+    known = [noise for noise in noises if noise]
+    default_noise = float(np.median(known)) if known else 1.0
+    gains = [1.0] * count
+    offsets = [0.0] * count
+    ramps = [coverage_transition_weight(valid, transition) for valid in valids]
+    reports: list[Optional[dict[str, Any]]] = [None] * count
+
+    def blend(indices: list[int]) -> tuple[np.ndarray, np.ndarray]:
+        numerator = np.zeros(tiles[0].shape, dtype=np.float32)
+        denominator = np.zeros(tiles[0].shape, dtype=np.float32)
+        for index in indices:
+            noise = noises[index] or default_noise
+            weight = np.float32(1.0 / (gains[index] * noise) ** 2)
+            share = (ramps[index] + np.float32(1e-6)) * valids[index] * weight
+            numerator += share * (tiles[index] * np.float32(gains[index]) + np.float32(offsets[index]))
+            denominator += share
+        valid = np.zeros(tiles[0].shape, dtype=bool)
+        for index in indices:
+            valid |= valids[index]
+        out = np.zeros(tiles[0].shape, dtype=np.float32)
+        np.divide(numerator, denominator, out=out, where=denominator > 0)
+        out[~valid] = 0
+        return out, valid
+
+    order = [reference]
+    reports[reference] = {
+        "index": reference, "reference": True, "gain": 1.0, "offset": 0.0,
+        "overlap_pixels": 0, "fit": None, "warnings": [],
+    }
+    composite, composite_valid = blend(order)
+    remaining = [index for index in range(count) if index != reference]
+    while remaining:
+        following = max(
+            remaining,
+            key=lambda index: (int((valids[index] & composite_valid).sum()), -index),
+        )
+        remaining.remove(following)
+        overlap = valids[following] & composite_valid
+        warnings: list[str] = []
+        fit = None
+        if overlap.any():
+            # Same-scale tiles share a PSF, so a light blur suffices; full
+            # resolution keeps enough samples in narrow overlap strips.
+            fit_sigma = 4.0
+            factor = 1
+            reference_smooth, _factor = _masked_blur_lowres(
+                composite, composite_valid, fit_sigma, factor
+            )
+            tile_smooth, _factor = _masked_blur_lowres(
+                tiles[following], valids[following], fit_sigma, factor
+            )
+            fit = robust_gain_offset(
+                reference_smooth, tile_smooth,
+                erode_mask(_block_all(overlap, factor), int(math.ceil(2 * fit_sigma / factor))),
+            )
+            del reference_smooth, tile_smooth
+        if fit is not None and 0.02 <= fit["gain"] <= 50.0:
+            gain, offset = fit["gain"], fit["offset"]
+            if fit["residual_fraction"] > 0.25:
+                warnings.append(
+                    f"Tiles agree poorly after matching (residual "
+                    f"{fit['residual_fraction']:.0%}); check that both masters are "
+                    "linear and artifact-free."
+                )
+        elif overlap.any():
+            gain = 1.0
+            offset = float(np.median(composite[overlap]) - np.median(tiles[following][overlap]))
+            warnings.append("Brightness fit was unreliable; used an offset-only match.")
+        else:
+            gain, offset = 1.0, 0.0
+            warnings.append(
+                "This master does not overlap the others, so its brightness could not "
+                "be matched and is kept as-is."
+            )
+        gains[following], offsets[following] = gain, offset
+        order.append(following)
+        reports[following] = {
+            "index": following, "reference": False, "gain": gain, "offset": offset,
+            "overlap_pixels": int(overlap.sum()), "fit": fit, "warnings": warnings,
+        }
+        composite, composite_valid = blend(order)
+    return composite, composite_valid, {
+        "reference": reference,
+        "order": order,
+        "tiles": [reports[index] for index in range(count)],
+    }
+
+
 def merge_master_layers(
     records: list[dict[str, Any]],
     output_dir: Path,
@@ -3927,8 +4078,14 @@ def merge_master_layers(
     transition_pixels: int = 0,
     detail_sigma: float = 0.0,
     log: Callable[[str], None] = lambda _message: None,
+    same_scale_mosaic: bool = False,
 ) -> tuple[list[Path], dict[str, Any]]:
     """Composite registered masters per filter and write one master per filter.
+
+    With ``same_scale_mosaic`` several masters of a filter may share a layer;
+    they are mosaicked first (combine_same_scale_tiles) and the output keeps
+    the bounding box of all coverage instead of one common rectangle, because
+    a union of tiles is rarely rectangular.
 
     Each record holds ``filter``, ``layer`` (1 = finest), ``native`` (the solved
     master at its own scale) and ``aligned`` (Siril's reprojection onto the
@@ -4016,15 +4173,36 @@ def merge_master_layers(
             union = coverage if union is None else (union | coverage)
         assert union is not None
         footprints[name] = _block_all(union, 4)
-    largest = max(int(mask.sum()) for mask in footprints.values())
-    common: Optional[np.ndarray] = None
-    for name, mask in footprints.items():
-        if mask.sum() >= 0.9 * largest:
-            common = mask if common is None else (common & mask)
-    assert common is not None
-    small_x, small_y, small_width, small_height = largest_valid_mask_crop(common, 1)
-    crop = (small_x * 4, small_y * 4, small_width * 4, small_height * 4)
-    del footprints, common
+    if same_scale_mosaic:
+        covered: Optional[np.ndarray] = None
+        for mask in footprints.values():
+            covered = mask if covered is None else (covered | mask)
+        assert covered is not None
+        rows = np.flatnonzero(covered.any(axis=1))
+        columns = np.flatnonzero(covered.any(axis=0))
+        if rows.size == 0:
+            raise RuntimeError("The registered masters contain no data.")
+        top, left = int(rows[0]) * 4, int(columns[0]) * 4
+        bottom = min(canvas_shape[0], (int(rows[-1]) + 1) * 4)
+        right = min(canvas_shape[1], (int(columns[-1]) + 1) * 4)
+        crop = (left, top, right - left, bottom - top)
+        crop_mode = "union"
+        log(
+            "Mosaic of masters: keeping every master's coverage; areas outside it "
+            "stay black for you to crop."
+        )
+    else:
+        largest = max(int(mask.sum()) for mask in footprints.values())
+        common: Optional[np.ndarray] = None
+        for name, mask in footprints.items():
+            if mask.sum() >= 0.9 * largest:
+                common = mask if common is None else (common & mask)
+        assert common is not None
+        small_x, small_y, small_width, small_height = largest_valid_mask_crop(common, 1)
+        crop = (small_x * 4, small_y * 4, small_width * 4, small_height * 4)
+        crop_mode = "common"
+        del common
+    del footprints
 
     report: dict[str, Any] = {
         "canvas_scale_arcsec": canvas_scale,
@@ -4032,8 +4210,44 @@ def merge_master_layers(
         "registration_grid_error_px": round(grid_error, 4),
         "transition_pixels": round(transition, 1),
         "crop": {"x": crop[0], "y": crop[1], "width": crop[2], "height": crop[3]},
+        "crop_mode": crop_mode,
         "filters": {},
     }
+
+    def layer_image(
+        group: list[dict[str, Any]], name: str
+    ) -> tuple[np.ndarray, np.ndarray, fits.Header, dict[str, Any], Optional[dict[str, Any]]]:
+        """One layer's image on the canvas: a single master, or a mosaic of several."""
+        if len(group) == 1:
+            data, header = _load_on_canvas(group[0], canvas_shape)
+            return data, valid_footprint(data), header, group[0], None
+        arrays, valids, headers = [], [], []
+        for record in group:
+            data, header = _load_on_canvas(record, canvas_shape)
+            arrays.append(data)
+            valids.append(valid_footprint(data))
+            headers.append(header)
+        combined, valid, tiles = combine_same_scale_tiles(
+            arrays, valids, [record["noise"] for record in group], transition
+        )
+        del arrays
+        for tile, record in zip(tiles["tiles"], group):
+            tile["source"] = str(record["source"])
+            for message in tile["warnings"]:
+                log(f"WARNING: {name}: {Path(record['source']).name}: {message}")
+            if not tile["reference"]:
+                log(
+                    f"Matched {name} {Path(record['source']).name} to the mosaic: gain "
+                    f"{tile['gain']:.4g}, offset {tile['offset']:.3g}."
+                )
+        anchor = group[tiles["reference"]]
+        fwhms = [record["fwhm_native_px"] for record in group if record["fwhm_native_px"]]
+        representative = {
+            **anchor,
+            # Conservative for the layer chain: the widest PSF, the anchor's noise.
+            "fwhm_native_px": max(fwhms) if fwhms else None,
+        }
+        return combined, valid, headers[tiles["reference"]], representative, tiles
     output_dir.mkdir(parents=True, exist_ok=True)
     outputs: list[Path] = []
     for name in filters:
@@ -4041,9 +4255,15 @@ def merge_master_layers(
             (record for record in records if record["filter"] == name),
             key=lambda record: record["layer"],
         )
-        base_record = layered[0]
-        composite, header = _load_on_canvas(base_record, canvas_shape)
-        composite_valid = valid_footprint(composite)
+        groups: list[list[dict[str, Any]]] = []
+        for record in layered:
+            if groups and groups[-1][0]["layer"] == record["layer"]:
+                groups[-1].append(record)
+            else:
+                groups.append([record])
+        composite, composite_valid, header, base_record, base_tiles = layer_image(
+            groups[0], name
+        )
         base_ratio = (base_record["native_scale"] or canvas_scale) / canvas_scale
         composite_fwhm = (
             base_record["fwhm_native_px"] * base_ratio
@@ -4065,9 +4285,12 @@ def merge_master_layers(
             ],
             "merges": [],
         }
-        for record in layered[1:]:
-            coarse, _coarse_header = _load_on_canvas(record, canvas_shape)
-            coarse_valid = valid_footprint(coarse)
+        if base_tiles is not None:
+            filter_report["tiles"] = base_tiles["tiles"]
+        for group in groups[1:]:
+            coarse, coarse_valid, _coarse_header, record, group_tiles = layer_image(group, name)
+            if group_tiles is not None:
+                filter_report.setdefault("wide_tiles", {})[str(record["layer"])] = group_tiles["tiles"]
             ratio = (record["native_scale"] or canvas_scale) / canvas_scale
             fwhm_canvas = (
                 record["fwhm_native_px"] * ratio
@@ -4185,7 +4408,8 @@ def merge_master_layers(
         # SBPP never mistakes it for a raw sub in a later scan.
         header["IMAGETYP"] = "Master Light"
         header["SBPPMERG"] = (True, "SBPP multi-scale master merge")
-        header["MRGLAYRS"] = (len(layered), "Plate-scale layers merged")
+        header["MRGLAYRS"] = (len(groups), "Plate-scale layers merged")
+        header["MRGTILES"] = (len(layered), "Masters merged")
         header["HISTORY"] = (
             f"SBPP {VERSION} multi-scale master merge of {len(layered)} layer(s)"
         )
@@ -7109,18 +7333,22 @@ class PipelineEngine:
                     if old != new
                 )
             )
-        if max(layers) < 2:
+        tile_counts = Counter(
+            (layer, normalized_text(entry.filter_name))
+            for entry, layer in zip(merge.masters, layers)
+        )
+        same_scale_mosaic = any(count > 1 for count in tile_counts.values())
+        if max(layers) < 2 and not same_scale_mosaic:
             raise RuntimeError("Every solved master has the same plate scale; nothing to merge.")
-        seen: set[tuple[int, str]] = set()
-        for entry, layer in zip(merge.masters, layers):
-            key = (layer, normalized_text(entry.filter_name))
-            if key in seen:
-                raise RuntimeError(
-                    f"Two {entry.filter_name} masters share solved layer {layer}; "
-                    "same-scale masters cannot be merged yet."
-                )
-            seen.add(key)
         grid = choose_merge_grid(layers, solved_scales, options.merge_output_grid)
+        if same_scale_mosaic and grid["grid"] != "finest":
+            # A mosaic needs a canvas covering every tile: only the finest
+            # grid's padded reference does that (Siril frames on one image).
+            fine_index = layers.index(min(layers))
+            grid = {
+                "grid": "finest", "reference_index": fine_index, "scale": 1.0,
+                "reason": "a mosaic of masters needs a canvas covering every tile",
+            }
         report.update({
             "masters": [
                 {
@@ -7201,6 +7429,7 @@ class PipelineEngine:
             transition_pixels=options.merge_transition_pixels,
             detail_sigma=options.merge_detail_sigma,
             log=self.log_callback,
+            same_scale_mosaic=same_scale_mosaic,
         )
         report.update(merge_report)
         self._verify_outputs(outputs, "Writing merged masters")
