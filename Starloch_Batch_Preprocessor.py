@@ -7114,7 +7114,7 @@ class MainWindow(QMainWindow):
         self.panel_layout_button = QPushButton("Panel layout…")
         self.panel_layout_button.setToolTip("Show how the mosaic panels line up on the sky.")
         self.panel_layout_button.setEnabled(False)
-        self.panel_layout_button.clicked.connect(self._show_panel_map)
+        self.panel_layout_button.clicked.connect(lambda: self._show_panel_map())
         controls.addWidget(self.panel_layout_button)
         controls.addWidget(self.save_plan_button)
         controls.addWidget(self.start_button)
@@ -8230,6 +8230,8 @@ class MainWindow(QMainWindow):
             self._populate_drizzle_channels(self.current_plan)
             self._display_plan(self.current_plan)
             self._refresh_panel_map()
+            if self.panel_layout_button.isEnabled():
+                self._show_panel_map(activate=False)
             self._save_profile()
             self.save_plan_button.setEnabled(True)
             self.start_button.setEnabled(self.current_plan.valid)
@@ -8715,13 +8717,18 @@ class MainWindow(QMainWindow):
             plan and any(dataset.panel_count > 1 for dataset in plan.datasets)
         ))
 
-    def _show_panel_map(self) -> None:
+    def _show_panel_map(self, activate: bool = True) -> None:
         if self.panel_map_window is None:
             self.panel_map_window = PanelMapWindow()
         self.panel_map_window.set_plan(self.current_plan)
+        # Opened automatically after a scan, it must not steal keyboard focus.
+        self.panel_map_window.setAttribute(
+            Qt.WidgetAttribute.WA_ShowWithoutActivating, not activate
+        )
         self.panel_map_window.show()
         self.panel_map_window.raise_()
-        self.panel_map_window.activateWindow()
+        if activate:
+            self.panel_map_window.activateWindow()
 
     def _refresh_panel_map(self) -> None:
         self._update_panel_layout_button()
