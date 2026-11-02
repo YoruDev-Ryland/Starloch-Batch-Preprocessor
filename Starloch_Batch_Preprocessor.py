@@ -1058,7 +1058,8 @@ def metadata_from_header(
         "OBSTYPE", "CALTYPE",
     ) or image_type
     frame_type, is_master = classify_type(kind_value, path, role_hint)
-    stack_count = safe_int(first_header(header, "NCOMBINE", "STACKCNT"))
+    # NSTACK: Celestron Origin writes its on-device calibration masters this way.
+    stack_count = safe_int(first_header(header, "NCOMBINE", "STACKCNT", "NSTACK"))
     if stack_count and stack_count > 1:
         is_master = True
     pointing_ra, pointing_dec, pointing_source = pointing_from_header(header)
